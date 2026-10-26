@@ -110,33 +110,47 @@ def resolve_solver(requested):
 
 
 def boolean_mesh(context, base_mesh, cutter_mesh, operation, solver='AUTO'):
-    """Return a NEW mesh = base_mesh <operation> cutter_mesh (both in the same space).
-
-    operation: 'DIFFERENCE' | 'UNION' | 'INTERSECT'
-    With solver AUTO the manifold solver is tried first and EXACT is used as a
-    fallback when the result comes back empty.
-    """
+    """Return a NEW mesh = base_mesh <operation> cutter_mesh (both in the same space)."""
     scene = context.scene
     base = new_temp_object(scene, base_mesh, "_esp_bool_base")
     cutter = new_temp_object(scene, cutter_mesh, "_esp_bool_cutter")
     result = None
     try:
-        chain = [resolve_solver(solver)]
-        if solver == 'AUTO' and chain[0] != 'EXACT':
-            chain.append('EXACT')
+        ids = available_solvers()
+        first = resolve_solver(solver)
+        chain = [first]
+        # Always add fallback solvers (EXACT, FLOAT/FAST, MANIFOLD) if the primary solver fails
+        for fallback in ('EXACT', 'FLOAT', 'FAST', 'MANIFOLD'):
+            if fallback in ids and fallback not in chain:
+                chain.append(fallback)
+
+        base_v = len(base_mesh.vertices)
+        base_p = len(base_mesh.polygons)
+        base_bounds = mesh_bounds(base_mesh) if base_v > 0 else None
+
         for sv in chain:
             mod = base.modifiers.new("esp_bool", 'BOOLEAN')
             mod.operation = operation
             mod.object = cutter
             mod.solver = sv
+            if hasattr(mod, "use_self"):
+                mod.use_self = False
+            if hasattr(mod, "use_hole_tolerant"):
+                mod.use_hole_tolerant = True
             context.view_layer.update()
             me = evaluated_mesh_copy(context, base, base_mesh.name + "_bool")
             base.modifiers.remove(mod)
-            unchanged = len(me.polygons) == len(base_mesh.polygons) and len(me.vertices) == len(base_mesh.vertices)
+
+            unchanged = len(me.polygons) == base_p and len(me.vertices) == base_v
+            if unchanged and base_v > 0 and len(me.vertices) > 0:
+                # In case vertex and polygon counts coincidentally match, check bounding box
+                b_new = mesh_bounds(me)
+                if (b_new[0] - base_bounds[0]).length > 1e-5 or (b_new[1] - base_bounds[1]).length > 1e-5:
+                    unchanged = False
+
             if (len(me.polygons) > 0 and not unchanged) or (operation == 'INTERSECT' and not unchanged):
                 result = me
                 break
-            # empty result, or the solver refused to run (mesh returned untouched): try the next solver
             remove_mesh(me)
         if result is None:
             result = bpy.data.meshes.new(base_mesh.name + "_bool")

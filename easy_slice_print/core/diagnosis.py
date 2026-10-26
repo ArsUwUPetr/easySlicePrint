@@ -16,9 +16,9 @@ cutter: the side its face looks at. Those are the seeds. Two fronts then flood t
 result's edge graph, one from each side, and never cross the slot, since the slot
 has no edges across it. Where the fronts meet is material that connects the two
 halves without going through the cut, and that is the bridge to be painted red. A
-slot that stops inside the material meets at its own end wall; a plane that also
-crossed a sword meets on the sword; a rim that welded to the surface meets along the
-weld.
+slot that stops inside the material meets at its end wall; a plane that crosses
+additional geometry meets on the remaining connection; a rim that welded to the
+surface meets along the weld.
 
 A cutter that never carved a face on both sides of itself did not cut at all - it
 missed the model, or only grazed it - and there is no bridge to find: `cut` is False

@@ -43,6 +43,13 @@ TOOL_ITEMS = [
         'GREASEPENCIL',
         2,
     ),
+    (
+        'OBJECT',
+        "Object Joint",
+        "Create a clearance fit and connector by subtracting selected cutter objects from a target object",
+        'MOD_BOOLEAN',
+        3,
+    ),
 ]
 
 SURFACE_ORIGIN_ITEMS = [
@@ -60,6 +67,38 @@ SURFACE_ORIGIN_ITEMS = [
         'OBJECT_ORIGIN',
         1,
     ),
+]
+
+LOOP_FILL_ITEMS = [
+    (
+        'MEMBRANE',
+        "Membrane (Classic)",
+        "Standard Laplacian minimal surface (can create sharp overhangs on spiky rims)",
+    ),
+    # Disabled by request:
+    # (
+    #     'COLLAR',
+    #     "Normal Collar (90° Flange)",
+    #     "Steps straight into the model along the inward surface normal before filling, eliminating sharp overhangs",
+    # ),
+    # (
+    #     'BIHARMONIC',
+    #     "Biharmonic (Smooth 90°)",
+    #     "Smooth clamped-plate S-curve that enters at 90° to the outer wall and blends seamlessly into the center",
+    # ),
+]
+
+MIRROR_PIVOT_ITEMS = [
+    ('TARGET', "Target Origin", "Mirror across the target object's origin and local axes"),
+    ('WORLD', "World Origin", "Mirror across the world origin (0, 0, 0) and world axes"),
+    ('CURSOR', "3D Cursor", "Mirror across the 3D Cursor position"),
+    ('OBJECT', "Custom Object", "Mirror across a chosen reference object"),
+]
+
+MIRROR_AXIS_ITEMS = [
+    ('X', "X", "Mirror across the X axis"),
+    ('Y', "Y", "Mirror across the Y axis"),
+    ('Z', "Z", "Mirror across the Z axis"),
 ]
 
 SIDE_ITEMS = [
@@ -87,6 +126,55 @@ def _settings_update(self, context):
     plan.apply_fit(context, self)
 
 
+def _surface_settings_update(self, context):
+    """Rebuilds the green preview of the active cut when detail settings change in the UI."""
+    from . import plan
+
+    s = context.scene.esp
+    if not (0 <= s.active_cut < len(s.cuts)):
+        return
+    rec = s.cuts[s.active_cut]
+    target = rec.target_obj or (bpy.data.objects.get(rec.target) if rec.target else None)
+    for name in (rec.surface_a, rec.surface_b):
+        if not name:
+            continue
+        sobj = bpy.data.objects.get(name)
+        if sobj is not None and sobj.get("esp_kind") in ('FREEHAND', 'CURVED', 'STRAIGHT'):
+            sobj["esp_detail"] = s.surface_detail
+            plan.rebuild_surface(sobj, draft=False, context=context, target=target)
+    plan.refresh_record_frames(context, rec)
+
+
+def _poll_scene_mesh(self, obj):
+    return (
+        obj is not None
+        and obj.type == 'MESH'
+        and "esp_preview" not in obj
+        and obj.name in bpy.context.scene.objects
+    )
+
+
+def _target_obj_update(self, context):
+    from . import plan
+
+    if getattr(plan, "_suspend", 0):
+        return
+    self.target = self.target_obj.name if self.target_obj is not None else ""
+    plan.refresh_record_frames(context, self)
+
+
+def _cutter_obj_update(self, context):
+    from . import plan
+
+    if getattr(plan, "_suspend", 0):
+        return
+    if self.cutter_obj is not None:
+        self.cutter_objects = self.cutter_obj.name
+    elif "\t" not in self.cutter_objects:
+        self.cutter_objects = ""
+    plan.refresh_record_frames(context, self)
+
+
 def _record_show_update(self, context):
     from . import overlay, plan
 
@@ -98,6 +186,16 @@ def _active_update(self, context):
     from . import plan
 
     plan.on_active_changed(context)
+
+
+def _explode_distance_update(self, context):
+    if context is None or not getattr(self, "exploded", False):
+        return
+    from . import ops_misc, plan
+
+    parts = [o for o in context.scene.objects if "esp_home" in o]
+    if len(parts) >= 2:
+        ops_misc.explode(context, parts, self.explode_distance_mm * plan.mm(context), recompute=False)
 
 
 def connector_props(update=None):
@@ -200,6 +298,25 @@ class ESP_CutRecord(bpy.types.PropertyGroup):
         name="Show", default=True, description="Show the cut preview in the viewport", update=_record_show_update
     )
     target: StringProperty(name="Target", description="Object the cut was drawn on")
+    target_obj: PointerProperty(
+        name="Target Object",
+        type=bpy.types.Object,
+        description="Mesh object this cut is applied to",
+        poll=_poll_scene_mesh,
+        update=_target_obj_update,
+    )
+    cutter_objects: StringProperty(
+        name="Cutter Objects",
+        default="",
+        description="Tab-separated names of the secondary objects used in an Object Joint",
+    )
+    cutter_obj: PointerProperty(
+        name="Cutter Object",
+        type=bpy.types.Object,
+        description="Primary cutter mesh object for Object Joint",
+        poll=_poll_scene_mesh,
+        update=_cutter_obj_update,
+    )
     two_contact: BoolProperty(default=False)
     surface_a: StringProperty()
     surface_b: StringProperty()
@@ -217,14 +334,56 @@ class ESP_CutRecord(bpy.types.PropertyGroup):
         size=3, description="World point on the model used to pick the part this cut applies to"
     )
     built: BoolProperty(default=False)
+    build_state: EnumProperty(
+        name="Build State",
+        items=[
+            ('NONE', "Idle", ""),
+            ('WAIT', "Queued", "Waiting in build queue"),
+            ('ACTIVE', "Building", "Currently cutting this operation"),
+            ('DONE', "Done", "Successfully built"),
+            ('SKIPPED', "Skipped", "Skipped due to error"),
+            ('ERROR', "Failed", "Failed during build"),
+        ],
+        default='NONE',
+    )
 
 
 ESP_CutRecord.__annotations__.update(connector_props(update=_record_update))
 
 
+PLANE_FILL_ITEMS = [
+    ('RADIAL', "Radial (Rings)", "Concentric quad rings to a center vertex (ideal for Subdivision and sculpting)"),
+    ('NGON', "N-Gon", "Single flat polygon (good for manual Inset / Poke in Edit Mode)"),
+    ('QUADS', "Quads / Tris", "Scanfill triangles converted to quads"),
+]
+
+
 class ESP_Settings(bpy.types.PropertyGroup):
     mode: EnumProperty(name="Mode", items=MODE_ITEMS, default='QUICK')
     tool: EnumProperty(name="Cut Tool", items=TOOL_ITEMS, default='STRAIGHT')
+    plane_fill_mode: EnumProperty(
+        name="Plane Fill",
+        description="Topology of the generated Plane Cut cross-section",
+        items=PLANE_FILL_ITEMS,
+        default='RADIAL',
+        update=_surface_settings_update,
+    )
+    section_points: IntProperty(
+        name="Rim Points",
+        description="Number of evenly spaced vertices along the cross-section outline",
+        default=32,
+        min=8,
+        max=256,
+        update=_surface_settings_update,
+    )
+    section_rings: IntProperty(
+        name="Radial Rings",
+        description="Number of concentric rings inside a Radial plane section",
+        default=4,
+        min=1,
+        max=16,
+        update=_surface_settings_update,
+    )
     stroke_smoothing: FloatProperty(
         name="Smoothing",
         description=(
@@ -238,17 +397,58 @@ class ESP_Settings(bpy.types.PropertyGroup):
     )
     loop_smoothing: FloatProperty(
         name="Loop Smoothing",
-        description=(
-            "Round off a Freehand loop before the membrane is built. Off by default: a "
-            "freehand loop is the tool for tracing a detail, so the rim runs through the "
-            "points you drew and nothing rounds them away. Raise it a little only to take "
-            "the shake out of a long stroke - every step of it moves the cut off the line "
-            "you traced"
-        ),
+        description="Round off a Freehand loop before the membrane is built",
         default=0.0,
         min=0.0,
         max=1.0,
         subtype='FACTOR',
+        update=_surface_settings_update,
+    )
+    loop_fill_mode: EnumProperty(
+        name="Loop Profile",
+        description="How the interior of a Freehand loop is shaped near the outer wall",
+        items=LOOP_FILL_ITEMS,
+        default='MEMBRANE',
+        update=_surface_settings_update,
+    )
+    collar_depth_mm: FloatProperty(
+        name="Collar Depth",
+        description="How deep (in mm) the cut travels perpendicular to the outer wall before relaxing toward the center",
+        default=3.0,
+        min=0.1,
+        soft_max=500.0,
+        precision=2,
+        step=10,
+        update=_surface_settings_update,
+    )
+    collar_smoothing: FloatProperty(
+        name="Collar Smoothing",
+        description="Smooth the radial direction of the collar while keeping spike heights intact",
+        default=0.65,
+        min=0.0,
+        max=1.0,
+        subtype='FACTOR',
+        update=_surface_settings_update,
+    )
+    mirror_axis: EnumProperty(
+        name="Mirror Axis",
+        items=MIRROR_AXIS_ITEMS,
+        default='X',
+    )
+    mirror_pivot: EnumProperty(
+        name="Mirror Center",
+        items=MIRROR_PIVOT_ITEMS,
+        default='TARGET',
+    )
+    mirror_object: PointerProperty(
+        name="Mirror Object",
+        type=bpy.types.Object,
+        description="Reference object whose origin and axes define the mirror plane",
+    )
+    mirror_snap_surface: BoolProperty(
+        name="Snap to Surface",
+        default=True,
+        description="Project mirrored control points onto the nearest surface of the model to handle slight pose asymmetry",
     )
     surface_origin: EnumProperty(
         name="Surface Origin",
@@ -285,24 +485,17 @@ class ESP_Settings(bpy.types.PropertyGroup):
     )
     surface_detail: IntProperty(
         name="Surface Detail",
-        description=(
-            "Samples built between two control points. A Curve cut splines its stroke at this "
-            "resolution and a Freehand loop only subdivides its drawn points, so the rim stays "
-            "straight between them and passes through every one; the inside of the surface is "
-            "then relaxed flat, so both print as smooth as a Plane cut instead of showing the "
-            "facets of the control polyline. Set it to 1 for the raw polyline. A dense freehand "
-            "loop already carries more points than the budget, and uses as much of this as fits"
-        ),
+        description="Samples built between two control points",
         default=3,
         min=1,
         max=12,
+        update=_surface_settings_update,
     )
     two_contact: BoolProperty(
         name="Two Contacts / Base Split",
         default=False,
         description=(
-            "Draw two contacts with any cut tool; both are cut together as one operation "
-            "(e.g. two feet on a base). Each contact gets its own connector"
+            "Draw two contacts with any cut tool; both are processed in one operation, and each contact gets its own connector"
         ),
     )
     chain_cuts: BoolProperty(
@@ -348,6 +541,7 @@ class ESP_Settings(bpy.types.PropertyGroup):
         soft_max=200.0,
         precision=2,
         description="How far the parts move away from each other (mm)",
+        update=_explode_distance_update,
     )
     exploded: BoolProperty(default=False)
     export_folder: StringProperty(name="Folder", subtype='DIR_PATH', default="//ESP_Export/")
@@ -358,6 +552,16 @@ class ESP_Settings(bpy.types.PropertyGroup):
     base_object: StringProperty()
     built_collection: StringProperty()
     last_message: StringProperty()
+    build_in_progress: BoolProperty(default=False)
+    build_progress: FloatProperty(
+        name="Build Progress",
+        default=0.0,
+        min=0.0,
+        max=100.0,
+        subtype='PERCENTAGE',
+        precision=0,
+    )
+    build_status: StringProperty(default="")
 
 
 ESP_Settings.__annotations__.update(connector_props(update=_settings_update))

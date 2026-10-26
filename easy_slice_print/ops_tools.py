@@ -460,12 +460,9 @@ class ESP_OT_cut_straight(CutToolBase, bpy.types.Operator):
         else:
             data.center_hint = c
             data.anchor = c
-        # the cut surface is the model's own cross section on this plane - the area the
-        # print is really cut through - taken over every region the line ran across.
-        # The line picks the plane and says which regions to cut; it does not decide
-        # how big the surface is. Drag across one leg and the other is left alone; drag
-        # across the whole figure and the sword and the wings come with it, which is
-        # what stops a cut from removing material without separating anything.
+        # Use the model's cross section as the cut surface and include every region
+        # intersected by the drawn stroke. The stroke selects regions but does not
+        # determine the cut surface dimensions.
         half = u.length * 0.5
         span = (u.normalized(), -half, half)
         patch = plan.straight_section(context, self.target, c, n, span, loc if hit else c)

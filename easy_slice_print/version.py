@@ -27,5 +27,5 @@ def _read_version():
 
 
 VERSION = _read_version()
-#: What the UI shows, e.g. "0.3.1-alpha", or "0.2.3 alpha" when the number carries no stage.
+#: Normalized version string displayed in the UI.
 VERSION_LABEL = VERSION if not STAGE or STAGE in VERSION else f"{VERSION} {STAGE}"

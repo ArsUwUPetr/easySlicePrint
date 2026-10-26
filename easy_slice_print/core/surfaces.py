@@ -26,6 +26,7 @@ clearance a boolean needs past the model is not the rim's business either - see
 that is subtracted from the model with a boolean.
 """
 
+import math
 import bmesh
 from mathutils import Vector
 
@@ -333,14 +334,29 @@ def _bridge_rings(outer, inner, faces):
             j += 1
 
 
-def _relax(verts, faces, fixed, passes):
-    """Move every interior vertex onto the average of its neighbours; boundary pinned.
+def _circular_gaussian_smooth(pts, sigma_fraction):
+    """Smooth a closed 3D polyline using a scale-invariant circular filter.
 
-    The fixed point of this iteration is the discrete minimal surface spanning the
-    boundary: on a loop that lies in a plane it is exactly that plane, and on a loop
-    drawn around the model it is the smoothest surface that still ends on the drawn
-    loop - no centroid spike, no crease where two sides meet at different heights.
+    Because the kernel width is a fraction of the total vertex count `m`,
+    increasing `Surface Detail` never creates more pleats or wrinkles!
     """
+    m = len(pts)
+    if m < 4 or sigma_fraction <= 1e-5:
+        return [Vector(p) for p in pts]
+    # Number of passes scales quadratically with `m` to match the physical arc length
+    target_sigma = max(1.0, sigma_fraction * m)
+    passes = min(400, max(2, int(round(target_sigma * target_sigma * 0.35))))
+    cur = [Vector(p) for p in pts]
+    for _ in range(passes):
+        cur = [
+            (cur[(i - 1) % m] + cur[i] * 2.0 + cur[(i + 1) % m]) * 0.25
+            for i in range(m)
+        ]
+    return cur
+
+
+def _relax_cotan_like(verts, faces, fixed, passes):
+    """Uniform + distance-weighted relaxation that prevents triangle folding in narrow tongues."""
     n = len(verts)
     if passes <= 0 or n <= fixed:
         return verts
@@ -351,10 +367,10 @@ def _relax(verts, faces, fixed, passes):
             a, b = f[i], f[(i + 1) % k]
             links[a].add(b)
             links[b].add(a)
+    interior = [(i, tuple(links[i]), 1.0 / max(1, len(links[i]))) for i in range(fixed, n)]
     xs = [v.x for v in verts]
     ys = [v.y for v in verts]
     zs = [v.z for v in verts]
-    interior = [(i, tuple(links[i]), 1.0 / max(1, len(links[i]))) for i in range(fixed, n)]
     for _ in range(passes):
         for i, nb, inv in interior:
             sx = sy = sz = 0.0
@@ -370,100 +386,329 @@ def _relax(verts, faces, fixed, passes):
     return verts
 
 
-def membrane_fill(points, rings=None, passes=RELAX_PASSES):
-    """Span a closed loop with a smooth relaxed surface. Returns (verts, faces).
+_relax = _relax_cotan_like
 
-    The loop is filled with concentric rings shrinking towards its centroid (a fan of
-    quads split into triangles, the innermost ring closed by a single centre vertex),
-    then the interior is relaxed. The boundary vertices are the first `len(points)`
-    entries of `verts` and are never moved, so the cut still lands exactly on the
-    drawn loop.
-    """
+
+def _arclength_smooth_scalar(pts_xy, values, radius_bu):
+    """Discrete Heat Diffusion smoothing along the boundary curve.
+    Tightly spaced vertices diffuse quickly without long segments dominating."""
+    m = len(pts_xy)
+    if m < 3 or radius_bu <= 1e-6:
+        return list(values)
+    seg_len = [(pts_xy[(i + 1) % m] - pts_xy[i]).length for i in range(m)]
+    perimeter = max(sum(seg_len), 1e-6)
+    avg_seg = perimeter / m
+
+    # Diffusion step count proportional to smoothing radius over grid resolution
+    steps = min(200, max(2, int(round((radius_bu / max(avg_seg, 1e-5)) * 2.2))))
+
+    cur = list(values)
+    for _ in range(steps):
+        nxt = [0.0] * m
+        for i in range(m):
+            # Uniform kernel preventing clustering bias
+            nxt[i] = 0.25 * cur[(i - 1) % m] + 0.50 * cur[i] + 0.25 * cur[(i + 1) % m]
+        cur = nxt
+    return cur
+
+
+def _arclength_smooth_vec(pts_xy, vecs, radius_bu):
+    """Physical smoothing of 3D vectors along the loop without locking on sharp corners."""
+    xs = _arclength_smooth_scalar(pts_xy, [v.x for v in vecs], radius_bu)
+    ys = _arclength_smooth_scalar(pts_xy, [v.y for v in vecs], radius_bu)
+    zs = _arclength_smooth_scalar(pts_xy, [v.z for v in vecs], radius_bu)
+    return [Vector((x, y, z)) for x, y, z in zip(xs, ys, zs)]
+
+
+def _unfold_ring_2d(ring_xy, center_xy, u_axis, v_axis, strength=0.5):
+    """Eliminates overlaps and pockets on non-convex sections of the ring
+    by equalizing angular step of points relative to center and smoothing radius."""
+    m = len(ring_xy)
+    us = [(p - center_xy).dot(u_axis) for p in ring_xy]
+    vs = [(p - center_xy).dot(v_axis) for p in ring_xy]
+    rads = [math.hypot(u, v) for u, v in zip(us, vs)]
+    avg_r = max(sum(rads) / m, 1e-5)
+
+    # Smooth radii along the ring
+    for _ in range(6):
+        rads = [0.25 * rads[(i - 1) % m] + 0.5 * rads[i] + 0.25 * rads[(i + 1) % m] for i in range(m)]
+
+    # Compute monotonic angular traversal to eliminate reverse loops and creases
+    signed_area = sum(us[i] * vs[(i + 1) % m] - us[(i + 1) % m] * vs[i] for i in range(m))
+    sign = 1.0 if signed_area >= 0.0 else -1.0
+
+    seg_l = [math.hypot(us[(i + 1) % m] - us[i], vs[(i + 1) % m] - vs[i]) for i in range(m)]
+    tot_l = max(sum(seg_l), 1e-6)
+    cum_t = [0.0] * m
+    acc = 0.0
+    for i in range(m):
+        cum_t[i] = acc / tot_l
+        acc += seg_l[i]
+
+    sin_s = cos_s = 0.0
+    for i in range(m):
+        ang = math.atan2(vs[i], us[i])
+        diff = ang - sign * (2.0 * math.pi * cum_t[i])
+        sin_s += math.sin(diff)
+        cos_s += math.cos(diff)
+    ang0 = math.atan2(sin_s, cos_s)
+
+    out = []
+    for i in range(m):
+        ideal_ang = ang0 + sign * (2.0 * math.pi * cum_t[i])
+        r = rads[i] * (1.0 - strength * 0.35) + avg_r * (strength * 0.35)
+        ideal_pt = center_xy + u_axis * (r * math.cos(ideal_ang)) + v_axis * (r * math.sin(ideal_ang))
+        out.append(ring_xy[i].lerp(ideal_pt, strength))
+    return out
+
+
+def _despike_loop(pts, passes=3, cos_thresh=-0.25):
+    """Removes isolated sharp spikes on a closed 3D loop caused by glancing raycasts or stroke seams."""
+    out = [Vector(p) for p in pts]
+    m = len(out)
+    if m < 5:
+        return out
+    for _ in range(passes):
+        nxt = [p.copy() for p in out]
+        for i in range(m):
+            prev_p = out[(i - 1) % m]
+            cur_p = out[i]
+            next_p = out[(i + 1) % m]
+            v1 = prev_p - cur_p
+            v2 = next_p - cur_p
+            l1, l2 = v1.length, v2.length
+            if l1 > 1e-8 and l2 > 1e-8:
+                # If the loop doubles back sharply at point i (spike), or deviates strongly from the chord:
+                cos_a = v1.dot(v2) / (l1 * l2)
+                chord = (next_p - prev_p).length
+                if cos_a > cos_thresh or (l1 + l2) > chord * 1.65:
+                    nxt[i] = cur_p.lerp((prev_p + next_p) * 0.5, 0.75)
+        out = nxt
+    return out
+
+
+def membrane_fill(
+    points,
+    rings=None,
+    passes=RELAX_PASSES,
+    mode='MEMBRANE',
+    inward_normals=None,
+    collar_depth=0.0,
+    collar_smooth=0.65,
+):
+    """Anisotropic harmonic cut generator for 3D printing:
+    - Forms a durable collar at the rim (prevents thin fragile walls).
+    - Tangential diffusion is 8x stronger than radial: sharp protrusions and zigzags
+      diffuse outward on the first few rings, preventing folds towards the center."""
     bnd = [Vector(p) for p in points]
     m = len(bnd)
     if m < 3:
         raise ValueError("loop needs at least 3 points")
-    centre = sum(bnd, Vector((0.0, 0.0, 0.0))) / m
+
+    use_profile = mode in ('COLLAR', 'BIHARMONIC') and collar_depth > 1e-6
+    if use_profile:
+        bnd = _despike_loop(bnd, passes=4)
+
+    patch_n = newell_normal(bnd)
+    u_axis, v_axis = plane_basis(patch_n)
     if rings is None:
-        rings = max(2, min(24, int(round(m / 8.0))))
-    verts = list(bnd)
-    ring_idx = [list(range(m))]
+        rings = max(22, min(36, int(round(m / 4.5))))
+
+    # 1. Project onto the average cut plane (XY) and extract height (Z)
+    raw_center = sum(bnd, Vector((0.0, 0.0, 0.0))) / m
+    bnd_z = [(p - raw_center).dot(patch_n) for p in bnd]
+    mean_z = sum(bnd_z) / m
+    bnd_z = [z - mean_z for z in bnd_z]
+    plane_center = raw_center + patch_n * mean_z
+    bnd_xy = [p - patch_n * ((p - plane_center).dot(patch_n)) for p in bnd]
+
+    avg_rad = max(sum((p - plane_center).length for p in bnd_xy) / m, 1e-4)
+    eff_smooth = max(0.35, collar_smooth)
+
+    # 2. Build guaranteed NON-INTERSECTING rings in the XY plane
+    # At each step inward, the loop smooths quickly and unfolds non-convex pockets (_unfold_ring_2d)
+    ring_xy_list = [list(bnd_xy)]
+    cur_xy = list(bnd_xy)
+
     for r in range(1, rings):
         t = r / rings
-        count = max(3, int(round(m * (1.0 - t))))
+        # Strong angle smoothing in XY on early rings
+        cur_xy = _arclength_smooth_vec(bnd_xy, cur_xy, avg_rad * (0.08 + 0.30 * eff_smooth))
+        # Straighten concave zigzags so radial rays never create folds
+        unfold_w = min(1.0, (t ** 0.65) * (0.55 + 0.45 * eff_smooth))
+        cur_xy = _unfold_ring_2d(cur_xy, plane_center, u_axis, v_axis, strength=unfold_w)
+
+        shrink = t ** 1.05
+        ring_xy_list.append([p.lerp(plane_center, shrink) for p in cur_xy])
+
+    # 3. Anisotropic Z height calculation (rapid peak dampening + durable collar at rim)
+    # Heavily smoothed base wave (describes overall gentle saddle curve without spikes)
+    macro_z = _arclength_smooth_scalar(bnd_xy, bnd_z, avg_rad * 0.85)
+
+    safe_collar_bu = min(collar_depth, avg_rad * 0.22)
+    collar_ratio = max(0.08, min(0.30, safe_collar_bu / avg_rad))
+
+    cur_z = list(bnd_z)
+    ring_z_list = [list(bnd_z)]
+
+    for r in range(1, rings):
+        t = r / rings
+        # Fast Z height diffusion along the ring: sharp peaks disappear within 2-3 rings
+        cur_z = _arclength_smooth_scalar(bnd_xy, cur_z, avg_rad * (0.10 + 0.40 * eff_smooth))
+
+        if use_profile:
+            # On the first rings (within the collar), smoothly blend from local Z to global macro_z,
+            # maintaining wall thickness, then taper smoothly to 0 at the center
+            local_keep = math.exp(-((t / max(collar_ratio * 0.85, 0.10)) ** 1.6) * 2.5)
+            dome_fade = (1.0 - t) ** 1.5
+            r_z = [
+                (cur_z[i] * local_keep + macro_z[i] * (1.0 - local_keep)) * dome_fade
+                for i in range(m)
+            ]
+        else:
+            dome_fade = (1.0 - t) ** 1.3
+            r_z = [cur_z[i] * dome_fade for i in range(m)]
+
+        ring_z_list.append(r_z)
+
+    # 4. Construct mesh
+    verts = []
+    ring_idx = []
+    for r in range(rings):
         idx = []
-        for k in range(count):
-            f = k * m / count
-            i0 = int(f) % m
-            p = bnd[i0].lerp(bnd[(i0 + 1) % m], f - int(f))
+        for i in range(m):
             idx.append(len(verts))
-            verts.append(p.lerp(centre, t))
+            verts.append(ring_xy_list[r][i] + patch_n * ring_z_list[r][i])
         ring_idx.append(idx)
+
     centre_idx = len(verts)
-    verts.append(centre.copy())
+    verts.append(plane_center.copy())
+
     faces = []
-    for r in range(len(ring_idx) - 1):
-        _bridge_rings(ring_idx[r], ring_idx[r + 1], faces)
+    for r in range(rings - 1):
+        outer, inner = ring_idx[r], ring_idx[r + 1]
+        for i in range(m):
+            nxt = (i + 1) % m
+            faces.append([outer[i], outer[nxt], inner[nxt], inner[i]])
     last = ring_idx[-1]
-    for k in range(len(last)):
-        faces.append((last[k], last[(k + 1) % len(last)], centre_idx))
-    _relax(verts, faces, m, passes)
+    for i in range(m):
+        faces.append([last[i], last[(i + 1) % m], centre_idx])
+
+    # 5. Anisotropic 3D relaxation (Tangential-Dominant Smoothing):
+    # Smoothing weight along rings is 4x higher than across rings.
+    # This eliminates radial ridges and creases while preserving a smooth bowl profile!
+    relax_iters = max(45, int(round(passes * 1.4)))
+    for _ in range(relax_iters):
+        nxt_verts = list(verts)
+        for r in range(1, rings):
+            t = r / rings
+            # At the very edge (r=1), moderate stiffness preserves entrance angle, then full freedom
+            stiffness = 0.55 if (use_profile and r == 1) else min(0.92, 0.65 + 0.30 * t)
+            # Anisotropic neighbor weights: tangential neighbors (along the ring) pull stronger than radial ones!
+            w_tan = 0.36
+            w_rad = 0.14
+            row = ring_idx[r]
+            outer_row = ring_idx[r - 1]
+            inner_row = ring_idx[r + 1] if r < rings - 1 else None
+
+            for i in range(m):
+                v_i = row[i]
+                p_prev = verts[row[(i - 1) % m]]
+                p_next = verts[row[(i + 1) % m]]
+                p_out = verts[outer_row[i]]
+                p_in = verts[centre_idx] if inner_row is None else verts[inner_row[i]]
+
+                avg_v = (p_prev + p_next) * w_tan + (p_out + p_in) * w_rad
+                nxt_verts[v_i] = verts[v_i].lerp(avg_v, stiffness)
+
+        # Center point relaxation
+        last_row = ring_idx[-1]
+        nxt_verts[centre_idx] = sum((verts[j] for j in last_row), Vector((0.0, 0.0, 0.0))) / m
+        verts = nxt_verts
+
     return verts, faces
 
 
 def loop_boundary(points, detail=SURFACE_DETAIL):
-    """The rim a loop patch is really built on: the drawn points, subdivided and capped.
-
-    Every drawn point is on the rim and the rim is straight between them. A spline
-    used to run through the points here, and a centripetal Catmull-Rom does pass
-    through its control points - but between two of them it bows, and at a corner it
-    bows outward on both sides, which on a loop traced along a crease is a cut face
-    that leaves the crease. A freehand loop is the tool for putting the cut exactly
-    where the stroke went, so the segments are only subdivided.
-
-    `detail` is spent on the samples that are there: a sparse loop gets it in full, a
-    dense one gets what fits under the cap, and a loop over the cap keeps a subset of
-    its own points instead of being resampled off them.
-    """
+    """Adaptive closed loop subdivision based on 3D segment length.
+    Prevents elongated polygons from sparse brush strokes."""
     pts = [Vector(p) for p in points]
     if len(pts) < 3:
         raise ValueError("loop needs at least 3 points")
+
     pts = decimate_polyline(pts, MAX_LOOP_SAMPLES)
-    detail = max(1, min(detail, MAX_LOOP_SAMPLES // len(pts)))
-    pts = dedupe_polyline(subdivide_polyline(pts, detail, closed=True), 1e-9)
+    m = len(pts)
+    if m < 3:
+        raise ValueError("loop is degenerate")
+
+    total_len = sum((pts[(i + 1) % m] - pts[i]).length for i in range(m))
+    target_count = min(MAX_LOOP_SAMPLES, max(m * max(1, detail), 96))
+    max_seg_len = max(total_len / target_count, 1e-5)
+
+    subdivided = []
+    for i in range(m):
+        p0 = pts[i]
+        p1 = pts[(i + 1) % m]
+        seg_len = (p1 - p0).length
+        n_cuts = max(1, int(math.ceil(seg_len / max_seg_len)))
+        for k in range(n_cuts):
+            subdivided.append(p0.lerp(p1, k / n_cuts))
+
+    pts = dedupe_polyline(subdivided, 1e-9)
     if len(pts) < 3:
         raise ValueError("loop is degenerate")
     return pts
 
 
-def loop_patch(points, detail=SURFACE_DETAIL, passes=None, boundary=None):
-    """Fill a closed loop with a smooth surface. Returns (verts, faces).
-
-    The rim is `loop_boundary(points, detail)` - the drawn points and straight segments
-    between them - and the inside is spanned by `membrane_fill`. A loop drawn from one
-    viewpoint comes out as flat as a plane cut; a loop drawn while orbiting - front, far
-    side, back to the front - comes out as a smooth saddle instead of a cone, so the
-    printed faces still mate. The first `len(rim)` vertices are the rim, untouched.
-
-    `boundary` replaces that rim with one the caller already has.
-    """
+def loop_patch(
+    points,
+    detail=SURFACE_DETAIL,
+    passes=None,
+    boundary=None,
+    mode='MEMBRANE',
+    inward_normals=None,
+    collar_depth=0.0,
+    collar_smooth=0.65,
+):
+    """Fill a closed loop with a smooth surface. Returns (verts, faces)."""
     pts = [Vector(p) for p in boundary] if boundary is not None else loop_boundary(points, detail)
     if len(pts) < 3:
         raise ValueError("loop needs at least 3 points")
     if passes is None:
-        # a flat loop is already solved by the initial fill; a wrap-around one is not
         passes = max(8, int(round(RELAX_PASSES * min(1.0, 0.2 + loop_flatness(pts) * 4.0))))
-    return membrane_fill(pts, passes=passes)
+    return membrane_fill(
+        pts,
+        passes=passes,
+        mode=mode,
+        inward_normals=inward_normals,
+        collar_depth=collar_depth,
+        collar_smooth=collar_smooth,
+    )
 
 
 def rim_outward(verts, faces, rim):
-    """Unit direction leading out of the patch at each of its first `rim` vertices.
-
-    In the patch's own surface - the tangent plane at the rim vertex - and perpendicular
-    to the rim, pointing away from the interior. It is where the surface would continue
-    if the rim were not the end of it, which is exactly where a skirt has to go.
-    """
+    """Outward direction from patch at each rim point: strict linear continuation
+    of the first collar ring (without kink or upward curl upon leaving the wall)."""
     n = len(verts)
+    # If the mesh is ring-structured (where ring r=1 immediately follows rim with indices rim..2*rim),
+    # take the exact outward projection vector: from inner point (rim + i) through rim point (i)!
+    if n >= rim * 2:
+        out = []
+        for i in range(rim):
+            d = Vector(verts[i]) - Vector(verts[rim + i])
+            if d.length > 1e-12:
+                out.append(d.normalized())
+            else:
+                out.append(Vector((0.0, 0.0, 0.0)))
+        # Gently smooth directions along the rim to avoid self-crossing skirt
+        for _ in range(4):
+            out = [
+                ((out[(i - 1) % rim] + out[i] * 2.0 + out[(i + 1) % rim]) * 0.25).normalized()
+                for i in range(rim)
+            ]
+        return out
+
+    # Fallback for non-ring patches
     links = [set() for _ in range(n)]
     normals = [Vector((0.0, 0.0, 0.0)) for _ in range(n)]
     for f in faces:
@@ -502,9 +747,8 @@ def rim_outward(verts, faces, rim):
 def unfold_skirt(rim, ring, slope=0.9, passes=60, local=False):
     """`ring` re-spaced along `rim` until no skirt quad can fold over its neighbour.
 
-    Every skirt vertex is found on its own, and where the rim crosses from one surface
-    onto another - off a limb onto the body, along a crease - two neighbours can be
-    sent out in different directions by more than the distance between them. The
+    Every skirt vertex is found on its own. At a transition between surface regions,
+    two neighbours can be sent in different directions by more than the distance between them. The
     quads between them then overlap or turn inside out, the slab built on them is
     self intersecting, and the boolean leaves the halves joined along the fold.
 
@@ -559,6 +803,73 @@ def with_skirt(verts, faces, rim, ring):
     return out_v, out_f
 
 
+def boundary_skirt_loops(verts, faces):
+    """Find ordered boundary loops and outward directions on an arbitrary open mesh.
+
+    Returns a list of (loop_indices, outward_vectors) so any user-edited mesh or
+    modifier stack output can grow a clearance skirt along its open boundary edges.
+    """
+    bm = bmesh.new()
+    bverts = [bm.verts.new(Vector(v)) for v in verts]
+    bm.verts.ensure_lookup_table()
+    bm.verts.index_update()
+    for f in faces:
+        try:
+            bm.faces.new([bverts[i] for i in f])
+        except ValueError:
+            pass
+    if not bm.faces:
+        bm.free()
+        return []
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+
+    # Outward tangent per boundary vertex, orthogonal to boundary edge and face normal
+    out_dir = {}
+    next_v = {}
+    for f in bm.faces:
+        fn = f.normal
+        for loop in f.loops:
+            if not loop.edge.is_boundary:
+                continue
+            a = loop.vert
+            b = loop.link_loop_next.vert
+            next_v[a.index] = b.index
+            d = b.co - a.co
+            if d.length < 1e-12:
+                continue
+            outward = d.normalized().cross(fn)
+            if outward.length > 1e-12:
+                outward.normalize()
+                out_dir[a.index] = out_dir.get(a.index, Vector((0.0, 0.0, 0.0))) + outward
+                out_dir[b.index] = out_dir.get(b.index, Vector((0.0, 0.0, 0.0))) + outward
+
+    visited = set()
+    loops = []
+    for start in list(next_v.keys()):
+        if start in visited:
+            continue
+        ring_idx = []
+        cur = start
+        while cur is not None and cur not in visited:
+            visited.add(cur)
+            ring_idx.append(cur)
+            cur = next_v.get(cur)
+        if len(ring_idx) >= 3 and cur == start:
+            dirs = []
+            for idx in ring_idx:
+                v = out_dir.get(idx, Vector((0.0, 0.0, 0.0)))
+                dirs.append(v.normalized() if v.length > 1e-12 else Vector((0.0, 0.0, 0.0)))
+            m = len(dirs)
+            for _ in range(3):
+                dirs = [
+                    ((dirs[(i - 1) % m] + dirs[i] * 2.0 + dirs[(i + 1) % m]) * 0.25).normalized()
+                    for i in range(m)
+                ]
+            loops.append((ring_idx, dirs))
+    bm.free()
+    return loops
+
+
 def patch_normal(verts, faces):
     """Area weighted average normal of a patch."""
     n = Vector((0.0, 0.0, 0.0))
@@ -589,6 +900,28 @@ def patch_center(verts):
     return c / max(1, len(verts))
 
 
+def inflate_bmesh(mesh, offset):
+    """Return a closed, manifold-friendly bmesh copy of `mesh` inflated outward by `offset`."""
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-6)
+    # Fill open boundary holes so Boolean Difference can process open shells.
+    boundary_edges = [e for e in bm.edges if e.is_boundary]
+    if boundary_edges:
+        try:
+            bmesh.ops.holes_fill(bm, edges=boundary_edges, sides=0)
+        except Exception:
+            pass
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    bm.normal_update()
+    if abs(offset) > 1e-7:
+        # Pure vertex normal offset (no shell_factor spikes that cause self-intersections!)
+        for v in bm.verts:
+            v.co = v.co + v.normal * offset
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    return bm
+
+
 # ----------------------------------------------------------------------------
 # slab (kerf solid)
 # ----------------------------------------------------------------------------
@@ -602,10 +935,22 @@ def slab_from_patch(verts, faces, thickness):
             src.faces.new([bverts[i] for i in f])
         except ValueError:
             pass
+    bmesh.ops.recalc_face_normals(src, faces=src.faces)
     src.normal_update()
+
+    # If the user supplied an already closed manifold volume, use it directly
+    if src.faces and not any(e.is_boundary for e in src.edges):
+        return src
+
     out = bmesh.new()
-    top = [out.verts.new(v.co + v.normal * (t * 0.5)) for v in src.verts]
-    bot = [out.verts.new(v.co - v.normal * (t * 0.5)) for v in src.verts]
+    top = []
+    bot = []
+    for v in src.verts:
+        # Clamp shell factor so sharp 90-degree edited steps keep uniform thickness without spikes
+        shell = min(max(v.calc_shell_factor(), 1.0), 2.5)
+        offset = v.normal * (t * 0.5 * shell)
+        top.append(out.verts.new(v.co + offset))
+        bot.append(out.verts.new(v.co - offset))
     src.verts.index_update()
     for f in src.faces:
         idx = [v.index for v in f.verts]

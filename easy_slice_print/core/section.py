@@ -1,31 +1,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Rafael Omodei and EasySlice Print contributors
-"""Real cross sections of the model, used as cut surfaces.
+"""Build cut surfaces from cross sections of the evaluated model mesh.
 
-A plane cut used to build a rectangle sized to the mouse stroke: as wide as the line
-you dragged and as deep as every ray under it happened to reach. Drawing across one
-leg of a figure therefore produced a slab the size of the whole character, because
-the samples that overshot the leg hit the torso and the other leg behind it.
-
-This module takes the other route: the model already has the geometry, so the cut
-surface is simply the model sliced by the plane. `plane_section` bisects a copy of
-the evaluated mesh, fills the resulting loops, splits the fill into connected
-islands - one per region the plane crosses, an annulus for a hollow shell - and
-hands back the islands the stroke actually ran across, grown outwards by a hair so
-the boolean never has to resolve coplanar faces.
-
-"The islands the stroke ran across" is the whole rule, and it has to be taken
-literally. The cut plane contains the view direction, so on screen the whole plane
-collapses onto the line that was drawn: an island is under the stroke exactly when
-its span along the drawn direction overlaps the stroke's. Picking the single island
-nearest the middle of the line instead looks the same on a figure with one limb in
-the way and is wrong on everything else - a plane through a saint's chest also
-crosses the sword and the wings, and leaving those uncut means the two halves stay
-joined through them and the boolean reports that it did not split anything.
-
-Plane cuts use this directly. Curve cuts use the one dimensional form, `band_around`,
-through `plan.ribbon_surfaces`; freehand loops need none of it. See the note at the
-bottom of this file for where each of the three stands.
+`plane_section` bisects a mesh copy, fills the resulting loops, separates the fill
+into connected islands, and returns the islands intersected by the drawn stroke.
+The islands are slightly expanded to prevent coplanar faces during Boolean
+operations. Curve cuts use `band_around` to select intersected regions along a
+one-dimensional path. Freehand cuts do not use cross-section selection.
 """
 
 import time
@@ -36,7 +17,7 @@ from mathutils import Vector
 from . import mesh_utils, surfaces
 
 # The source mesh is bisected destructively, so every section needs its own copy.
-# Re-reading a 500k figure out of Blender on every preview refresh is what would make
+# Re-reading a large mesh from Blender on every preview refresh would make
 # dragging a cut plane crawl, so the untouched original is kept for a moment and only
 # copied. The window is short on purpose: the cache only has to survive one drag, and
 # anything longer risks slicing a mesh the user has since edited.
@@ -262,16 +243,113 @@ def clip_rect(keep, skip, co, normal, u_axis, bounds, pad):
 
 
 # ----------------------------------------------------------------------------
+# radial topology & loop extraction
+# ----------------------------------------------------------------------------
+def _extract_ordered_loops(faces):
+    """Extract closed vertex loops from boundary edges of a group of faces."""
+    face_set = set(faces)
+    adj_v = {}
+    for f in faces:
+        for l in f.loops:
+            if sum(1 for lf in l.edge.link_faces if lf in face_set) == 1:
+                adj_v.setdefault(l.vert, []).append(l.link_loop_next.vert)
+
+    loops = []
+    visited_edges = set()
+    for start in adj_v:
+        for nxt in adj_v[start]:
+            edge = (start, nxt)
+            if edge in visited_edges:
+                continue
+            loop = [start.co.copy()]
+            visited_edges.add(edge)
+            curr = nxt
+            while curr != start:
+                loop.append(curr.co.copy())
+                cands = [nb for nb in adj_v.get(curr, []) if (curr, nb) not in visited_edges]
+                if not cands:
+                    break
+                step = cands[0]
+                visited_edges.add((curr, step))
+                curr = step
+            if len(loop) >= 3 and curr == start:
+                loops.append(loop)
+    return loops
+
+
+def _build_radial_island(loops, rim_points, radial_rings, normal):
+    """Build concentric quad rings and central fan for an island."""
+    if not loops:
+        return [], []
+    loops.sort(key=lambda pts: sum((pts[(i + 1) % len(pts)] - pts[i]).length for i in range(len(pts))), reverse=True)
+    outer_raw = loops[0]
+    n_pts = max(8, rim_points)
+    outer = surfaces.resample_polyline(outer_raw, n_pts, closed=True)
+    n = len(outer)
+    if n < 3:
+        return [], []
+
+    center = sum(outer, Vector((0.0, 0.0, 0.0))) / float(n)
+    rings = max(1, radial_rings)
+
+    verts = []
+    for r in range(rings):
+        t = r / float(rings)
+        ring = [(1.0 - t) * p + t * center for p in outer]
+        if r > 0:
+            ring = surfaces.smooth_polyline(ring, factor=0.45, closed=True)
+        verts.extend(ring)
+
+    center_idx = len(verts)
+    verts.append(center)
+
+    faces = []
+    for r in range(rings - 1):
+        r0 = r * n
+        r1 = (r + 1) * n
+        for i in range(n):
+            ni = (i + 1) % n
+            faces.append((r0 + i, r0 + ni, r1 + ni, r1 + i))
+
+    last_r = (rings - 1) * n
+    for i in range(n):
+        ni = (i + 1) % n
+        faces.append((last_r + i, last_r + ni, center_idx))
+
+    ref_n = Vector(normal)
+    fixed_faces = []
+    for f in faces:
+        v0, v1, v2 = verts[f[0]], verts[f[1]], verts[f[2]]
+        fn = (v1 - v0).cross(v2 - v0)
+        if fn.dot(ref_n) < 0:
+            fixed_faces.append(tuple(reversed(f)))
+        else:
+            fixed_faces.append(f)
+
+    return verts, fixed_faces
+
+
+# ----------------------------------------------------------------------------
 # the section itself
 # ----------------------------------------------------------------------------
-def plane_section(obj, plane_co, plane_no, span=None, reference=None, margin=0.0, depsgraph=None, epsilon=1e-6):
+def plane_section(
+    obj,
+    plane_co,
+    plane_no,
+    span=None,
+    reference=None,
+    margin=0.0,
+    depsgraph=None,
+    epsilon=1e-6,
+    rim_points=32,
+    fill_mode='RADIAL',
+    radial_rings=4,
+):
     """The model's own cross section on the plane (`plane_co`, `plane_no`).
 
     `span` is the stroke: `(axis, lo, hi)` measured from `plane_co` along a world
-    direction lying in the plane. Every island overlapping it survives - draw across
-    one leg and the other is left alone, draw across the whole figure and the sword
-    and the wings come with it. `reference` is the fallback when the span matches
-    nothing (a line drawn off the model): the island nearest that point. With neither,
+    direction lying in the plane. Every island overlapping the span is returned.
+    `reference` selects the nearest island if the span matches none. With neither,
     every crossed island is returned.
 
     Returns a `SectionResult` - a (verts, faces) pair in world space that also carries
@@ -330,12 +408,42 @@ def plane_section(obj, plane_co, plane_no, span=None, reference=None, margin=0.0
         chosen = {id(g) for g in groups}
         keep = {f.index for g in groups for f in g}
         cutter = _cutter_quad(obj, groups, [g for g in all_groups if id(g) not in chosen], co, n, span)
+
+        if fill_mode == 'RADIAL':
+            all_verts = []
+            all_faces = []
+            for g in groups:
+                loops = _extract_ordered_loops(g)
+                iv, ifaces = _build_radial_island(loops, rim_points, radial_rings, n)
+                if iv:
+                    base_idx = len(all_verts)
+                    all_verts.extend(iv)
+                    all_faces.extend(tuple(base_idx + idx for idx in f) for f in ifaces)
+            if all_verts and all_faces:
+                verts, faces = grow_section(all_verts, all_faces, margin, n)
+                return SectionResult(verts, faces, islands=total, kept=kept, cutter=cutter)
+
         drop = [f for f in bm.faces if f.index not in keep]
         if drop:
             bmesh.ops.delete(bm, geom=drop, context='FACES')
         if not bm.faces:
             return None
-        bmesh.ops.dissolve_limit(bm, angle_limit=1e-4, verts=list(bm.verts), edges=list(bm.edges))
+
+        if fill_mode == 'QUADS':
+            try:
+                bmesh.ops.join_triangles(
+                    bm,
+                    faces=list(bm.faces),
+                    cmp_sharp=False,
+                    cmp_uvs=False,
+                    cmp_vcols=False,
+                    cmp_materials=False,
+                )
+            except Exception:
+                pass
+        else:
+            bmesh.ops.dissolve_limit(bm, angle_limit=1e-4, verts=list(bm.verts), edges=list(bm.edges))
+
         if not bm.faces:
             return None
         bm.verts.index_update()
@@ -396,12 +504,9 @@ def merge_runs(intervals, tol=0.0):
 def band_around(intervals, anchor, pad, tol=0.0):
     """The run of material holding `anchor`, widened into the empty space beside it.
 
-    The one dimensional form of `clip_rect`, and it exists for the same reason. A
-    curve cut used to take one depth range for its whole length, from the furthest
-    ray hit anywhere under the stroke, so a line drawn across a figure's near leg
-    reached through the far one as well. Taking only the run the stroke is actually
-    standing on stops that, and stopping half way into the gap - rather than on the
-    surface - is what keeps the boolean's rim in free space.
+    The one-dimensional form of `clip_rect`. Select only the material run intersected
+    by the stroke and extend the range partway into adjacent empty space, keeping the
+    Boolean rim clear of the model surface.
 
     `intervals` are (lo, hi) pairs of "inside the model" along one axis. Returns
     (lo, hi), or None when there is nothing to stand on.
@@ -452,10 +557,11 @@ def _boundary_wall(verts, faces, normal, height):
     return mesh_utils.bvh_from_pydata(quads_v, quads_f)
 
 
-def _face_samples(verts, faces, rows=3):
-    """Centroid of every face plus a small barycentric grid inside it."""
+def _face_samples(verts, faces, rows=3, max_faces=250):
+    """Centroid of sampled faces plus a small barycentric grid inside them."""
     out = []
-    for f in faces:
+    step = max(1, len(faces) // max_faces)
+    for f in faces[::step]:
         ring = [Vector(verts[i]) for i in f]
         c = sum(ring, Vector((0.0, 0.0, 0.0))) / len(ring)
         out.append(c)
@@ -469,13 +575,9 @@ def _face_samples(verts, faces, rows=3):
 def inscribed_circle(verts, faces, normal, resolution=40, refinements=4):
     """Largest circle that fits inside a flat patch -> (centre, diameter).
 
-    This is what sizes and places a connector once the cut surface is the model's real
-    cross section: the biggest pin that still has material all around it, sitting where
-    that material is thickest. The old estimate marched rays out from a guessed centre
-    and then took the middle of their bounding box, which on any section that is not
-    roughly convex walks the pin straight out of the thick part - a plane through a
-    figure's chest catches the sword and the wing too, and the pin ends up a 3 mm stub
-    out on the blade. A section knows its own shape, so ask it instead.
+    This sizes and places a connector on the cut surface: the largest circle that fits
+    inside the patch, positioned where the material is thickest. Sampling the patch
+    shape directly keeps the connector within the available material.
 
     Points sampled across every face seed the search - which is also all a curved
     patch (a curve cut's ribbon, a freehand membrane) ever gets, since a grid laid out
@@ -553,7 +655,7 @@ def section_extent(verts):
 #
 # What is still approximate, in one place only: a curve cut gives each ribbon column
 # a single span, from the first entry to the last exit of the material under it. A
-# column crossing a hollow limb therefore covers the cavity as well. That is right for
+# column crossing a hollow section therefore covers the cavity as well. That is right for
 # the cutter and slightly generous for the preview, where a plane cut would show the
 # cavity as a hole. Fixing it means letting one column carry several spans, which
 # `surfaces.ribbon_patch` would have to grow a second index for.

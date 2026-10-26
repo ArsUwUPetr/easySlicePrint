@@ -835,6 +835,178 @@ def test_quick_plane_section():
     check(max(cut_leg) < 8.0, f"and it came apart at the plane (its leg tops out at {max(cut_leg):.1f})")
 
 
+def test_pointers_and_validation():
+    print("== pointers and two-stage validation")
+    sc = reset_scene()
+    s = sc.esp
+    s.mode = 'PLAN'
+    ctx = bpy.context
+
+    target = make_cylinder("Char")
+    cutter = make_cylinder("Seat")
+    cutter.location.x = 5.0  # intersects Char
+
+    gap_bu = 0.1 * plan.mm(ctx)
+    data = plan.object_joint_contact(ctx, target, [cutter], gap_bu)
+    rec = plan.add_record(ctx, target, 'OBJECT', [data], cutter_objs=[cutter])
+
+    check(rec.target_obj == target, "target_obj PointerProperty assigned")
+    check(rec.cutter_obj == cutter, "cutter_obj PointerProperty assigned")
+    check(rec.target == "Char", "target string property in sync")
+    check("Seat" in rec.cutter_objects, "cutter_objects string property in sync")
+
+    errs = plan.validate_plan(ctx)
+    check(len(errs) == 0, f"clean plan has no validation errors (got {errs})")
+
+    # Move cutter far away: bounding box intersection check
+    cutter.location.x = 500.0
+    ctx.view_layer.update()
+    errs = plan.validate_plan(ctx)
+    check(any("do not intersect" in e for e in errs), f"bounding box non-overlap caught ({errs})")
+    cutter.location.x = 5.0
+    ctx.view_layer.update()
+
+    # Test swap joint roles
+    s.active_cut = 0
+    res = bpy.ops.esp.swap_joint_roles()
+    check(res == {'FINISHED'}, "swap_joint_roles finished")
+    check(rec.target == "Seat" and rec.target_obj == cutter, "target swapped to Seat")
+    check("Char" in rec.cutter_objects, "cutters swapped to Char")
+
+    # Swap back
+    res = bpy.ops.esp.swap_joint_roles()
+    check(res == {'FINISHED'}, "swapped back")
+    check(rec.target == "Char" and rec.target_obj == target, "target back to Char")
+
+    # Test set_selected_cutters
+    extra = make_cylinder("Prop")
+    extra.location.y = 5.0
+    for o in ctx.view_layer.objects:
+        o.select_set(False)
+    extra.select_set(True)
+    cutter.select_set(True)
+    res = bpy.ops.esp.set_selected_cutters()
+    check(res == {'FINISHED'}, "set_selected_cutters finished")
+    cutters = plan.cutter_object_list(rec)
+    check(len(cutters) == 2, f"two cutters assigned ({[c.name for c in cutters]})")
+
+    # Delete extra: test clear_missing_cutters
+    mesh_utils.remove_object(extra)
+    missing = plan.missing_cutter_names(rec)
+    check("Prop" in missing, "missing cutter detected")
+    errs = plan.validate_plan(ctx)
+    check(any("missing" in e.lower() for e in errs), f"validation catches missing cutter ({errs})")
+    res = bpy.ops.esp.clear_missing_cutters()
+    check(res == {'FINISHED'}, "clear_missing_cutters finished")
+    check(len(plan.missing_cutter_names(rec)) == 0, "missing cutter removed")
+
+    # Mirror cut
+    res = bpy.ops.esp.mirror_cut()
+    check(res == {'FINISHED'}, "mirror cut executed")
+    check(len(s.cuts) == 2, "mirrored cut record created")
+    mir_rec = s.cuts[1]
+    check(mir_rec.target_obj == target, "mirrored cut target_obj assigned")
+
+    # UI draw test
+    draw_all_panels(ctx)
+    check(True, "panels draw with new tabs hierarchy")
+
+
+def test_pipeline_features():
+    print("== pipeline features (reordering, mirror refresh, live progress)")
+    sc = reset_scene()
+    s = sc.esp
+    s.mode = 'PLAN'
+    ctx = bpy.context
+
+    obj = make_cylinder("PipeModel")
+    diag = mesh_utils.object_world_diagonal(obj)
+
+    rec1 = plan.add_record(ctx, obj, 'STRAIGHT', [plane_contact(-10.0, diag)])
+    rec2 = plan.add_record(ctx, obj, 'STRAIGHT', [plane_contact(10.0, diag)])
+    name1 = rec1.name
+    name2 = rec2.name
+    check(len(s.cuts) == 2, "two cuts in plan")
+    check(s.cuts[0].name == name1 and s.cuts[1].name == name2, "initial cut order verified")
+
+    # Test move_cut UP and DOWN
+    s.active_cut = 1
+    res = bpy.ops.esp.move_cut(direction='UP')
+    check(res == {'FINISHED'}, "move_cut UP finished")
+    check(s.active_cut == 0 and s.cuts[0].name == name2 and s.cuts[1].name == name1, "rec2 moved UP to index 0")
+
+    res = bpy.ops.esp.move_cut(direction='DOWN')
+    check(res == {'FINISHED'}, "move_cut DOWN finished")
+    check(s.active_cut == 1 and s.cuts[0].name == name1 and s.cuts[1].name == name2, "rec2 moved DOWN to index 1")
+
+    # Test mirror cut and refresh
+    s.active_cut = 0
+    res = bpy.ops.esp.mirror_cut()
+    check(res == {'FINISHED'}, "mirror cut executed")
+    check(len(s.cuts) == 3, "mirrored cut created")
+    mir_rec = s.cuts[2]
+    s.active_cut = 2
+    mir_pin = bpy.data.objects.get(mir_rec.pin_a)
+    pin_loc0 = mir_pin.location.copy()
+
+    res = bpy.ops.esp.refresh_pins()
+    check(res == {'FINISHED'}, "refresh_pins on mirrored cut executed")
+    mir_pin_after = bpy.data.objects.get(mir_rec.pin_a)
+    diff = (mir_pin_after.location - pin_loc0).length
+    check(diff < 1e-2, f"mirrored pin position preserved after refresh (diff {diff:.4f})")
+
+    # Test pre-flight BVH validation
+    errs = plan.validate_plan(ctx, paint_overlay=True)
+    check(len(errs) == 0, f"valid plan passes validation (errs: {errs})")
+
+    # Move surface far away -> validation catches it
+    surf = bpy.data.objects.get(mir_rec.surface_a)
+    surf.location.x += 500.0
+    ctx.view_layer.update()
+    errs = plan.validate_plan(ctx, paint_overlay=True)
+    check(len(errs) > 0, "validation catches cut surface moved away from target")
+    surf.location.x -= 500.0
+    ctx.view_layer.update()
+
+    # Test UI drawing during active build progress
+    s.build_in_progress = True
+    s.build_progress = 50.0
+    s.build_status = "Building test..."
+    mir_rec.build_state = 'ACTIVE'
+    draw_all_panels(ctx)
+    check(True, "panels draw cleanly during active build progress")
+    s.build_in_progress = False
+    s.build_status = ""
+    mir_rec.build_state = 'NONE'
+
+    # Test smart exploded view and live distance slider update
+    cyl1 = make_cylinder("Part1", radius=5.0, height=20.0)
+    cyl2 = make_cylinder("Part2", radius=5.0, height=20.0)
+    cyl1["esp_part"] = True
+    cyl2["esp_part"] = True
+    cyl2.location.z = 20.0
+    cyl1_loc0 = cyl1.location.copy()
+    cyl2_loc0 = cyl2.location.copy()
+
+    s.explode_distance_mm = 10.0
+    bpy.ops.esp.explode()
+    check(s.exploded, "explode operator executed and set s.exploded = True")
+    loc_exp1 = cyl2.location.copy()
+    check(loc_exp1 != cyl2_loc0, "part moved during explode")
+    check("esp_explode_dir" in cyl2, "esp_explode_dir cached on part")
+
+    # Live update test via distance property slider
+    s.explode_distance_mm = 30.0
+    loc_exp2 = cyl2.location.copy()
+    check(loc_exp2 != loc_exp1, "part moved further after changing explode_distance_mm")
+
+    # Collapse test
+    bpy.ops.esp.collapse()
+    check(not s.exploded, "collapse operator executed and reset s.exploded = False")
+    check((cyl2.location - cyl2_loc0).length < 1e-4, "part returned to home position after collapse")
+    check("esp_explode_dir" not in cyl2, "esp_explode_dir cleaned up on collapse")
+
+
 def test_unregister():
     print("== unregister")
     easy_slice_print.unregister()
@@ -856,6 +1028,8 @@ if __name__ == "__main__":
     test_freehand_cut_lands_on_the_loop()
     test_plane_section_preview()
     test_build_shows_why_a_cut_failed()
+    test_pointers_and_validation()
+    test_pipeline_features()
     test_unregister()
     print(f"\n{len(FAILS)} failure(s)")
     for f in FAILS:

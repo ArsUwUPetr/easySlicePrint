@@ -80,18 +80,10 @@ def side_sign(point, bvh):
 def mesh_side(mesh, bvh, samples=600, floor=0.0):
     """Which side of the cut surface a separated piece came off. -> +1 or -1
 
-    One centroid test is enough for a plane cut, whose surface is flat and reaches past
-    the whole model. It is not enough for a freehand membrane: a piece's centroid can
-    sit well off the end of the membrane - a leg's centroid is half the model away from
-    a loop drawn round its thigh - and out there the nearest facet's normal says nothing
-    about which half the piece belongs to, so both halves come back on the same side and
-    a cut that worked is reported as one that did not split the part.
-
-    The vertices sitting ON the new cut face do know, and they are the ones closest to
-    the surface, so every vertex votes with a weight that falls off with its distance.
-    Nothing legitimate sits closer than half the kerf, so `floor` (a fraction of it)
-    caps the weight: a couple of boolean slivers lying right on the surface must not
-    outvote a whole cut face.
+    Classify the piece using vertices near the new cut face. Weight each vertex by its
+    distance from the surface so distant geometry has less influence. `floor`, a
+    fraction of the kerf, limits the influence of small Boolean artifacts near the
+    surface.
     """
     verts = mesh.vertices
     n = len(verts)
@@ -115,18 +107,16 @@ def mesh_side(mesh, bvh, samples=600, floor=0.0):
 def still_joined_message(spec):
     """Why the boolean removed material and the part still came out in one piece.
 
-    Almost always because the plane crosses the model somewhere the line did not: a
-    wing, a sword, a cloak, the base under the feet. Those regions are left uncut on
-    purpose - it is what keeps a cut across one leg from taking the other with it -
-    but the two halves stay joined through them, so the split never happens. Saying
-    how many were left out turns an unexplainable failure into one instruction.
+    The plane may cross regions outside the drawn stroke. Those regions are left
+    uncut, but can keep the resulting parts connected. Report how many regions were
+    skipped so the user can extend the stroke to include them.
     """
     skipped = max((c.regions_skipped for c in spec.contacts), default=0)
     if skipped:
         many = skipped > 1
         return (
             "The cut removed material but the part is still in one piece: the cut plane also crosses "
-            f"{skipped} other region{'s' if many else ''} of the model (a wing, a base, an arm) that your "
+            f"{skipped} other region{'s' if many else ''} of the model that your "
             f"line did not run across, and the two halves stay joined through {'them' if many else 'it'}. "
             f"Draw the cut line across {'those regions' if many else 'that region'} too."
         )
@@ -155,9 +145,9 @@ def protrude_direction(surface_normal, pin_side):
 def estimate_pin_frame(obj, depsgraph, patch_bvh, diag, surface_point=None, through_dir=None, center_hint=None):
     """-> (center, surface_normal, inscribed_diameter) in world space.
 
-    Either give `center_hint` (a point believed to be inside the part, e.g. the
-    centroid of a freehand loop) or `surface_point` + `through_dir`: where the
-    user's stroke touched the model and the direction that goes through it.
+    Provide either `center_hint`, a point inside the part, or `surface_point`
+    and `through_dir`, describing where the stroke touched the model and its
+    direction through the part.
     The centre is refined with in-plane rays so it sits in the middle of the
     cross-section; the shortest ray gives the inscribed diameter.
     """
@@ -213,6 +203,8 @@ def split_mesh_steps(context, mesh, spec):
     total = len(spec.contacts)
     try:
         for i, c in enumerate(spec.contacts):
+            if not c.verts or not c.faces:
+                continue
             yield f"cutting surface {i + 1}/{total}" if total > 1 else "cutting surface"
             slab_bm = surfaces.slab_from_patch(c.verts, c.faces, spec.gap)
             slab = mesh_utils.bmesh_to_mesh(slab_bm, "_esp_slab")
@@ -343,7 +335,10 @@ def perform_cut_steps(context, target_obj, spec, names, out_collection):
         obj = bpy.data.objects.new(name, me)
         obj["esp_part"] = True
         obj["esp_side"] = side
-        obj["esp_source"] = target_obj.name
+        # Preserve the source model name when cutting an already-sliced part.
+        root_source = target_obj.get("esp_source") or target_obj.get("esp_stem") or target_obj.name
+        obj["esp_source"] = root_source
+        obj["esp_stem"] = root_source
         out_collection.objects.link(obj)
         result.append(obj)
     return result[0], result[1], time.time() - t0
@@ -355,3 +350,191 @@ def perform_cut(context, target_obj, spec, names, out_collection):
     names: (name_a, name_b). Returns (obj_a, obj_b, seconds).
     """
     return drain(perform_cut_steps(context, target_obj, spec, names, out_collection))
+
+
+def _bounds_overlap(me_a, me_b, pad):
+    """Quick bounding box overlap check between two meshes with a safety padding `pad`."""
+    if len(me_a.vertices) == 0 or len(me_b.vertices) == 0:
+        return False
+    min_a, max_a = mesh_utils.mesh_bounds(me_a)
+    min_b, max_b = mesh_utils.mesh_bounds(me_b)
+    return (
+        min_a.x - pad <= max_b.x
+        and max_a.x + pad >= min_b.x
+        and min_a.y - pad <= max_b.y
+        and max_a.y + pad >= min_b.y
+        and min_a.z - pad <= max_b.z
+        and max_a.z + pad >= min_b.z
+    )
+
+
+def _clean_mesh_for_bool(mesh):
+    """Cleans a mesh from duplicate vertices and degenerate edges and recalculates normals before booleans."""
+    import bmesh
+
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-5)
+    bmesh.ops.dissolve_degenerate(bm, dist=1e-6, edges=bm.edges)
+    boundary_edges = [e for e in bm.edges if e.is_boundary]
+    if boundary_edges:
+        try:
+            bmesh.ops.holes_fill(bm, edges=boundary_edges, sides=0)
+        except Exception:
+            pass
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+
+
+def perform_object_joint_steps(context, target_objs, cutter_objs, spec, out_collection):
+    """Subtract inflated copies of `cutter_objs` from every intersecting part in
+    `target_objs` with mating clearance `spec.gap`,
+    then add calibrated connectors between them."""
+    t0 = time.time()
+    if not isinstance(target_objs, (list, tuple)):
+        target_objs = [target_objs]
+    if not target_objs or not cutter_objs:
+        raise CutError("Object Joint needs at least one target and one cutter object.")
+
+    yield "preparing meshes for object joint"
+    target_meshes = [mesh_utils.world_mesh_copy(context, o, f"_esp_joint_target_{i}") for i, o in enumerate(target_objs)]
+    part_meshes = [mesh_utils.world_mesh_copy(context, o, f"_esp_joint_part_{i}") for i, o in enumerate(cutter_objs)]
+    for m in target_meshes + part_meshes:
+        _clean_mesh_for_bool(m)
+    total = len(part_meshes)
+
+    try:
+        # 1. Carve each cutter part from all intersecting target parts.
+        for i, p_me in enumerate(part_meshes):
+            yield f"carving mating clearance {i + 1}/{total}"
+            inflated_bm = surfaces.inflate_bmesh(p_me, spec.gap)
+            inflated_me = mesh_utils.bmesh_to_mesh(inflated_bm, "_esp_inflated_cutter")
+            inflated_bm.free()
+
+            for t_idx, t_me in enumerate(target_meshes):
+                if not _bounds_overlap(t_me, inflated_me, max(spec.gap * 4.0, 0.05)):
+                    continue
+                res = mesh_utils.boolean_mesh(context, t_me, inflated_me, 'DIFFERENCE', spec.solver)
+                # If the clearance-inflated cutter had self-intersections on sharp bevels and returned empty,
+                # fall back to subtracting the uninflated original cutter mesh p_me directly:
+                if len(res.polygons) == 0:
+                    mesh_utils.remove_mesh(res)
+                    res = mesh_utils.boolean_mesh(context, t_me, p_me, 'DIFFERENCE', spec.solver)
+                if len(res.polygons) > 0:
+                    _clean_mesh_for_bool(res)
+                    mesh_utils.remove_mesh(t_me)
+                    target_meshes[t_idx] = res
+                else:
+                    mesh_utils.remove_mesh(res)
+
+            mesh_utils.remove_mesh(inflated_me)
+
+        # 2. Add calibrated connectors between the closest target piece and cutter piece
+        pins = [c for c in spec.contacts if c.add_pin and c.pin_matrix is not None]
+        for idx, c in enumerate(pins, start=1):
+            yield f"adding joint connector {idx}/{len(pins)}"
+            pin_center = c.pin_matrix.translation
+
+            best_t = 0
+            best_td = 1e30
+            for i, t_me in enumerate(target_meshes):
+                if len(t_me.polygons) == 0:
+                    continue
+                bvh = mesh_utils.bvh_from_mesh(t_me)
+                loc, _nor, _fidx, dist = bvh.find_nearest(pin_center)
+                if loc is not None and dist < best_td:
+                    best_td = dist
+                    best_t = i
+
+            best_c = 0
+            best_cd = 1e30
+            for i, p_me in enumerate(part_meshes):
+                if len(p_me.polygons) == 0:
+                    continue
+                bvh = mesh_utils.bvh_from_mesh(p_me)
+                loc, _nor, _fidx, dist = bvh.find_nearest(pin_center)
+                if loc is not None and dist < best_cd:
+                    best_cd = dist
+                    best_c = i
+
+            pin = connectors.connector_mesh(c.shape, c.custom_obj, c.pin_matrix, "_esp_pin", unit_mesh=c.pin_mesh)
+            socket = connectors.connector_mesh(
+                c.shape,
+                c.custom_obj,
+                c.pin_matrix,
+                "_esp_socket",
+                radial_extra=spec.clearance,
+                tip_extra=spec.tip_extra,
+                unit_mesh=c.pin_mesh,
+            )
+
+            t_me = target_meshes[best_t]
+            c_me = part_meshes[best_c]
+            if spec.pin_side == 'A':
+                new_target = mesh_utils.boolean_mesh(context, t_me, pin, 'UNION', spec.solver)
+                yield f"carving joint socket {idx}/{len(pins)}"
+                new_part = mesh_utils.boolean_mesh(context, c_me, socket, 'DIFFERENCE', spec.solver)
+            else:
+                new_part = mesh_utils.boolean_mesh(context, c_me, pin, 'UNION', spec.solver)
+                yield f"carving joint socket {idx}/{len(pins)}"
+                new_target = mesh_utils.boolean_mesh(context, t_me, socket, 'DIFFERENCE', spec.solver)
+
+            if len(new_target.polygons) > 0:
+                _clean_mesh_for_bool(new_target)
+                mesh_utils.remove_mesh(t_me)
+                target_meshes[best_t] = new_target
+            else:
+                mesh_utils.remove_mesh(new_target)
+
+            if len(new_part.polygons) > 0:
+                _clean_mesh_for_bool(new_part)
+                mesh_utils.remove_mesh(c_me)
+                part_meshes[best_c] = new_part
+            else:
+                mesh_utils.remove_mesh(new_part)
+
+            mesh_utils.remove_mesh(pin)
+            mesh_utils.remove_mesh(socket)
+
+        if spec.remesh and spec.remesh_voxel > 0.0:
+            for i in range(len(target_meshes)):
+                yield f"remeshing target part {i + 1}/{len(target_meshes)}"
+                target_meshes[i] = remesh_mesh(
+                    context, target_meshes[i], spec.remesh_voxel, spec.remesh_adaptivity, spec.remesh_smooth
+                )
+            for i in range(len(part_meshes)):
+                yield f"remeshing cutter part {i + 1}/{total}"
+                part_meshes[i] = remesh_mesh(
+                    context, part_meshes[i], spec.remesh_voxel, spec.remesh_adaptivity, spec.remesh_smooth
+                )
+    except Exception:
+        for m in target_meshes:
+            mesh_utils.remove_mesh(m)
+        for m in part_meshes:
+            mesh_utils.remove_mesh(m)
+        raise
+    finally:
+        mesh_utils.cleanup_temp(context.scene)
+
+    def _make_built_obj(me, src_obj, side_tag):
+        # Preserve original naming chain so subsequent cuts in the plan still find their target
+        base_stem = src_obj.get("esp_stem") or src_obj.get("esp_source") or src_obj.get("esp_base") or src_obj.name
+        name = f"{src_obj.name}_BUILT"
+        me.name = name
+        if src_obj.type == 'MESH':
+            for mat in src_obj.data.materials:
+                me.materials.append(mat)
+        obj = bpy.data.objects.new(name, me)
+        obj["esp_part"] = True
+        obj["esp_side"] = side_tag
+        obj["esp_source"] = base_stem
+        obj["esp_stem"] = base_stem
+        obj["esp_base"] = base_stem
+        out_collection.objects.link(obj)
+        return obj
+
+    built_targets = [_make_built_obj(m, src, 'A') for m, src in zip(target_meshes, target_objs)]
+    built_cutters = [_make_built_obj(m, src, 'B') for m, src in zip(part_meshes, cutter_objs)]
+    return built_targets, built_cutters, time.time() - t0

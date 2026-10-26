@@ -29,21 +29,139 @@ def part_objects(context):
     return [o for o in context.selected_objects if o.type == 'MESH']
 
 
-def explode(context, parts, distance_bu):
+def _compute_explode_dirs(context, parts):
+    """Compute and cache explode direction vectors once when Explode starts."""
+    import numpy as np
+
+    n_parts = len(parts)
+    homes = []
     centers = []
+    radii = []
+    weights = []
+    sampled_clouds = []
+    base_bboxes = []
+
     for p in parts:
         home = Vector(p["esp_home"]) if "esp_home" in p else p.location.copy()
         p["esp_home"] = list(home)
-        c = p.matrix_world @ mesh_utils.mesh_centroid(p.data)
-        c = c - p.location + home
-        centers.append(c)
-    if not centers:
-        return
-    gc = sum(centers, Vector((0.0, 0.0, 0.0))) / len(centers)
-    for p, c in zip(parts, centers):
+        homes.append(home)
+
+        mw_home = p.matrix_world.copy()
+        mw_home.translation = home
+
+        arr = mesh_utils.mesh_vertex_array(p.data)
+        if len(arr) == 0:
+            centers.append(home.copy())
+            radii.append(1e-4)
+            weights.append(1e-5)
+            sampled_clouds.append(np.zeros((1, 3), dtype=np.float32))
+            base_bboxes.append((home.copy(), home.copy()))
+            continue
+
+        rot_np = np.array(mw_home.to_3x3(), dtype=np.float32)
+        loc_np = np.array(home, dtype=np.float32)
+        world_arr = arr @ rot_np.T + loc_np
+
+        c_world = Vector(world_arr.mean(axis=0).tolist())
+        centers.append(c_world)
+
+        b_min = Vector(world_arr.min(axis=0).tolist())
+        b_max = Vector(world_arr.max(axis=0).tolist())
+        base_bboxes.append((b_min, b_max))
+
+        diag = b_max - b_min
+        r = max(diag.length * 0.5, 1e-4)
+        radii.append(r)
+
+        centered = world_arr - world_arr.mean(axis=0)
+        rms_sq = float(np.mean(np.sum(centered * centered, axis=1)))
+        weights.append(max(rms_sq ** 1.5, diag.x * diag.y * diag.z * 0.1, 1e-5))
+
+        step = max(1, len(world_arr) // 300)
+        sampled_clouds.append(world_arr[::step])
+
+    total_w = sum(weights)
+    gc = sum((c * w for c, w in zip(centers, weights)), Vector((0.0, 0.0, 0.0))) / (total_w if total_w > 1e-6 else 1.0)
+    max_dist = max(((c - gc).length for c in centers), default=1.0) or 1.0
+
+    # 1. Base dimensionless explode directions (multipliers relative to a distance of 1.0 BU).
+    dirs = [Vector((0.0, 0.0, 0.0)) for _ in parts]
+    for i, c in enumerate(centers):
         d = c - gc
+        if d.length > 1e-6:
+            # Farther parts move slightly faster (factor 0.7 to 1.6) to create gaps between
+            # neighboring parts in a chain.
+            tier = 0.7 + 0.9 * (d.length / max_dist)
+            dirs[i] = d.normalized() * tier
+
+    # 2. Resolve directions for nested parts whose centroids and base directions are close.
+    ref_step = max(max_dist * 0.15, 1e-4)
+    for _iteration in range(10):
+        any_overlap = False
+        for i in range(n_parts):
+            off_i = dirs[i] * ref_step
+            bmin_i = base_bboxes[i][0] + off_i
+            bmax_i = base_bboxes[i][1] + off_i
+
+            for j in range(i + 1, n_parts):
+                off_j = dirs[j] * ref_step
+                bmin_j = base_bboxes[j][0] + off_j
+                bmax_j = base_bboxes[j][1] + off_j
+
+                if (
+                    bmin_i.x > bmax_j.x or bmax_i.x < bmin_j.x
+                    or bmin_i.y > bmax_j.y or bmax_i.y < bmin_j.y
+                    or bmin_i.z > bmax_j.z or bmax_i.z < bmin_j.z
+                ):
+                    continue
+
+                pts_i = sampled_clouds[i] + np.array(off_i, dtype=np.float32)
+                pts_j = sampled_clouds[j] + np.array(off_j, dtype=np.float32)
+
+                diff = pts_i[:, None, :] - pts_j[None, :, :]
+                min_dist_sq = float(np.min(np.sum(diff * diff, axis=-1)))
+                thresh = (radii[i] + radii[j]) * 0.08
+                if min_dist_sq > thresh * thresh:
+                    continue
+
+                any_overlap = True
+                ci = centers[i] + off_i
+                cj = centers[j] + off_j
+                sep_dir = cj - ci
+                sep_dir = Vector((0.0, 0.0, 1.0)) if sep_dir.length < 1e-6 else sep_dir.normalized()
+
+                wi, wj = weights[i], weights[j]
+                w_sum = wi + wj
+                share_i = wj / w_sum if w_sum > 1e-6 else 0.5
+                share_j = wi / w_sum if w_sum > 1e-6 else 0.5
+
+                # Adjust dimensionless direction vectors so overlapping parts move apart.
+                dirs[i] -= sep_dir * (0.35 * share_i)
+                dirs[j] += sep_dir * (0.35 * share_j)
+
+        if not any_overlap:
+            break
+
+    # Keep the largest part stationary; all other directions are relative to it.
+    anchor_idx = max(range(n_parts), key=lambda k: weights[k])
+    base_dir = dirs[anchor_idx].copy()
+    for p, d in zip(parts, dirs):
+        rel_dir = d - base_dir
+        p["esp_explode_dir"] = list(rel_dir)
+
+
+def explode(context, parts, distance_bu, recompute=False):
+    if len(parts) < 2:
+        return
+    # Compute expensive geometry only when the cache is missing or Explode is triggered.
+    if recompute or any("esp_explode_dir" not in p or "esp_home" not in p for p in parts):
+        _compute_explode_dirs(context, parts)
+
+    # Slider updates only run this loop, keeping interactive movement responsive.
+    for p in parts:
         home = Vector(p["esp_home"])
-        p.location = home if d.length < 1e-9 else home + d.normalized() * distance_bu
+        d = Vector(p["esp_explode_dir"])
+        p.location = home + d * distance_bu
 
 
 def collapse(parts):
@@ -51,6 +169,8 @@ def collapse(parts):
         if "esp_home" in p:
             p.location = Vector(p["esp_home"])
             del p["esp_home"]
+        if "esp_explode_dir" in p:
+            del p["esp_explode_dir"]
 
 
 class ESP_OT_explode(bpy.types.Operator):
@@ -65,7 +185,7 @@ class ESP_OT_explode(bpy.types.Operator):
         if len(parts) < 2:
             self.report({'WARNING'}, "Need at least two parts")
             return {'CANCELLED'}
-        explode(context, parts, s.explode_distance_mm * plan.mm(context))
+        explode(context, parts, s.explode_distance_mm * plan.mm(context), recompute=True)
         s.exploded = True
         self.report({'INFO'}, f"Exploded {len(parts)} object(s)")
         return {'FINISHED'}

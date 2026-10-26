@@ -23,3 +23,12 @@ easy_slice_print/LICENSE
 # website (Astro)
 website/node_modules/
 website/.astro/
+.github
+CHANGELOG.md
+LICENSE
+website
+tests
+docs
+scripts
+/project-to-text.ps1
+/project_context.txt
