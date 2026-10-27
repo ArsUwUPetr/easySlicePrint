@@ -3,6 +3,7 @@
 """Plan (draft) records, preview objects and the glue between records and the
 core cut pipeline."""
 
+from contextlib import contextmanager
 import math
 
 import bpy
@@ -26,6 +27,26 @@ PREFIX = {
 }
 
 _suspend = 0
+_validation_cache = {"key": None, "errors": []}
+
+
+@contextmanager
+def suspend_updates():
+    """Temporarily suppress property update callbacks."""
+    global _suspend
+    _suspend += 1
+    try:
+        yield
+    finally:
+        _suspend -= 1
+
+
+def is_suspended():
+    return _suspend > 0
+
+
+def invalidate_validation_cache():
+    _validation_cache["key"] = None
 
 
 class ContactData:
@@ -166,9 +187,7 @@ def resolve_target(context):
 
 def sync_record_pointers(rec):
     """Keep PointerProperty fields in sync with stored names if set by scripts or older files."""
-    global _suspend
-    _suspend += 1
-    try:
+    with suspend_updates():
         if rec.target_obj is None and rec.target:
             obj = bpy.data.objects.get(rec.target)
             if obj is not None and obj.type == 'MESH':
@@ -184,8 +203,6 @@ def sync_record_pointers(rec):
         elif rec.cutter_obj is not None and len(raw_names) <= 1:
             if rec.cutter_objects != rec.cutter_obj.name:
                 rec.cutter_objects = rec.cutter_obj.name
-    finally:
-        _suspend -= 1
 
 
 def record_target(rec):
@@ -404,6 +421,33 @@ def validate_plan(context, paint_overlay=False):
                                 "(none of the cut surface intersects the mesh)."
                             )
     return errors
+
+
+def validate_plan_cached(context):
+    """Cached pre-flight validation for UI draw calls so the viewport stays smooth."""
+    s = context.scene.esp
+    key = (
+        len(bpy.data.objects),
+        tuple(
+            (
+                r.name,
+                r.enabled,
+                r.cut_type,
+                r.target,
+                r.target_obj.name if r.target_obj else "",
+                r.cutter_objects,
+                r.cutter_obj.name if r.cutter_obj else "",
+                r.surface_a,
+                r.surface_b,
+                r.cut_gap_mm,
+            )
+            for r in s.cuts
+        ),
+    )
+    if _validation_cache["key"] != key:
+        _validation_cache["errors"] = validate_plan(context, paint_overlay=False)
+        _validation_cache["key"] = key
+    return _validation_cache["errors"]
 
 
 # ----------------------------------------------------------------------------
@@ -766,18 +810,11 @@ def _march_clear(target, p, d, margin, depsgraph, want):
 
 
 def skirt_ring(context, target, verts, faces, rim, margin):
-    """Extends the cutter beyond the boundary loop `rim` by `margin` distance along the collar plane."""
+    """Extends the cutter beyond the boundary loop `rim` by `margin` distance."""
     out = surfaces.rim_outward(verts, faces, rim)
     pts = [Vector(verts[i]) for i in range(rim)]
     if target is None or context is None or margin <= 0.0:
         return [pts[i] + out[i] * margin for i in range(rim)]
-
-    # In COLLAR and BIHARMONIC modes, the collar already exits the wall at ~90 degrees,
-    # so the skirt must proceed strictly along vector `out[i]` without vertical offsets!
-    s = getattr(context.scene, "esp", None)
-    if s is not None and getattr(s, "loop_fill_mode", 'MEMBRANE') in ('COLLAR', 'BIHARMONIC'):
-        ring = [pts[i] + out[i] * margin for i in range(rim)]
-        return surfaces.unfold_skirt(pts, ring, passes=80)
 
     state = ensure_evaluable(target)
     try:
@@ -817,53 +854,10 @@ def skirt_ring(context, target, verts, faces, rim, margin):
         restore_visibility(target, state)
 
 
-def _boundary_inward_normals(context, target, boundary, patch_n):
-    """Compute inward-pointing surface normals along `boundary`, projected perpendicular to the cut normal."""
-    if target is None or context is None:
-        return None
-    state = ensure_evaluable(target)
-    try:
-        depsgraph = context.evaluated_depsgraph_get()
-        inward = []
-        for p in boundary:
-            found, _loc, nor, _depth = mesh_utils.object_surface_depth(target, p, depsgraph)
-            if not found:
-                inward.append(Vector((0.0, 0.0, 0.0)))
-                continue
-            # Project inward normal (-nor) mostly onto the cut plane so the collar doesn't dive vertically
-            d = -nor - patch_n * ((-nor).dot(patch_n) * 0.35)
-            inward.append(d.normalized() if d.length > 1e-6 else -nor)
-        return inward
-    finally:
-        restore_visibility(target, state)
-
-
 def loop_surface(context, target, points, detail, margin, passes=None):
     """The freehand membrane and its cutter. -> (verts, faces, cutter)"""
     boundary = settle_on_model(context, target, points, detail)
-    mode = 'MEMBRANE'
-    collar_depth = 0.0
-    collar_smooth = 0.65
-    inward = None
-    if context is not None and hasattr(context.scene, "esp"):
-        s = context.scene.esp
-        mode = getattr(s, "loop_fill_mode", 'MEMBRANE')
-        collar_depth = getattr(s, "collar_depth_mm", 1.5) * mm(context)
-        collar_smooth = getattr(s, "collar_smoothing", 0.65)
-        if mode in ('COLLAR', 'BIHARMONIC') and target is not None:
-            patch_n = surfaces.newell_normal(boundary)
-            inward = _boundary_inward_normals(context, target, boundary, patch_n)
-
-    verts, faces = surfaces.loop_patch(
-        points,
-        detail=detail,
-        passes=passes,
-        boundary=boundary,
-        mode=mode,
-        inward_normals=inward,
-        collar_depth=collar_depth,
-        collar_smooth=collar_smooth,
-    )
+    verts, faces = surfaces.loop_patch(points, detail=detail, passes=passes, boundary=boundary)
     rim = len(boundary)
     if margin <= 0.0:
         return verts, faces, None
@@ -900,59 +894,10 @@ def loop_margin(context, src, points, diag):
 
 
 def custom_mesh_cutter(context, target, verts, faces, margin):
-    """Expands open boundary edges of a custom mesh outward by `margin` distance
-    so that the boolean cutter is guaranteed to penetrate beyond the model walls."""
+    """Expands open boundary edges of a custom mesh outward by `margin` distance."""
     if not verts or not faces or margin <= 0.0:
         return verts, faces
-    import bmesh
-
-    bm = bmesh.new()
-    bverts = [bm.verts.new(Vector(v)) for v in verts]
-    bm.verts.ensure_lookup_table()
-    bm.verts.index_update()
-    for f in faces:
-        try:
-            bm.faces.new([bverts[i] for i in f])
-        except ValueError:
-            pass
-    if not bm.faces:
-        bm.free()
-        return verts, faces
-
-    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-    ref_n = surfaces.patch_normal(verts, faces)
-    if sum(f.normal.dot(ref_n) * f.calc_area() for f in bm.faces) < 0.0:
-        bmesh.ops.reverse_faces(bm, faces=list(bm.faces))
-
-    # Compute outward vector (in the plane of boundary polygons) for each boundary vertex
-    push = {}
-    for f in bm.faces:
-        fn = f.normal
-        for loop in f.loops:
-            if not loop.edge.is_boundary:
-                continue
-            a = loop.vert
-            b = loop.link_loop_next.vert
-            d = b.co - a.co
-            if d.length < 1e-12:
-                continue
-            outward = d.normalized().cross(fn)
-            if outward.length < 1e-12:
-                continue
-            outward.normalize()
-            push[a.index] = push.get(a.index, Vector((0.0, 0.0, 0.0))) + outward
-            push[b.index] = push.get(b.index, Vector((0.0, 0.0, 0.0))) + outward
-
-    # Shift boundary vertices outward by margin
-    out_v = [v.co.copy() for v in bm.verts]
-    out_f = [tuple(v.index for v in f.verts) for f in bm.faces]
-    bm.free()
-
-    for idx, acc in push.items():
-        if acc.length > 1e-12:
-            out_v[idx] = out_v[idx] + acc.normalized() * margin
-
-    return out_v, out_f
+    return section.grow_section(verts, faces, margin, surfaces.patch_normal(verts, faces))
 
 
 def reset_surface_to_procedural(context, rec, index=0):
@@ -1071,8 +1016,8 @@ def set_cutter(obj, local_verts, cutter):
         return
     tris = []
     for f in cutter[1]:
-        for k in range(1, len(f) - 1):
-            tris.extend((f[0], f[k], f[k + 1]))
+        for i0, i1, i2 in surfaces.triangulate_face_indices(local_verts, f):
+            tris.extend((i0, i1, i2))
     obj["esp_cutter"] = [c for p in local_verts for c in p]
     obj["esp_cutter_f"] = tris
     obj["esp_cutter_n"] = 3
@@ -1479,6 +1424,7 @@ def add_record(context, target, cut_type, contacts, cutter_objs=None):
         settings.active_cut = len(settings.cuts) - 1
     finally:
         _suspend -= 1
+        invalidate_validation_cache()
     return rec
 
 
@@ -1700,6 +1646,7 @@ def remove_record(context, index):
         mesh_utils.remove_object(obj)
     settings.cuts.remove(index)
     settings.active_cut = min(index, len(settings.cuts) - 1)
+    invalidate_validation_cache()
 
 
 def remove_all_records(context):
@@ -2048,6 +1995,7 @@ def _refresh_dirty():
         return 0.1
     names = list(_dirty)
     _dirty = {}
+    invalidate_validation_cache()
     for rec in scene.esp.cuts:
         if rec.surface_a in names or rec.surface_b in names:
             try:
@@ -2059,10 +2007,8 @@ def _refresh_dirty():
 
 @persistent
 def depsgraph_handler(scene, depsgraph):
-    global _suspend
     if _suspend:
         return
-    # Never trigger surface rebuilds while the user is in Edit/Sculpt mode or tweaking modifiers!
     active_obj = getattr(bpy.context, "active_object", None)
     if active_obj is not None and active_obj.mode != 'OBJECT':
         return
@@ -2078,16 +2024,23 @@ def depsgraph_handler(scene, depsgraph):
                 hit_idx = idx
                 break
         if hit_idx >= 0 and settings.active_cut != hit_idx:
-            _suspend += 1
-            try:
+            with suspend_updates():
                 settings.active_cut = hit_idx
-            finally:
-                _suspend -= 1
+
+    # Fast O(1) filter: only inspect surface transforms when a relevant object updated in depsgraph
+    if depsgraph is not None and hasattr(depsgraph, "updates"):
+        updated_names = {u.id.name for u in depsgraph.updates if isinstance(u.id, bpy.types.Object)}
+        if not updated_names:
+            return
+    else:
+        updated_names = None
 
     changed = False
     for rec in settings.cuts:
+        if updated_names is not None and rec.target in updated_names:
+            invalidate_validation_cache()
         for name in (rec.surface_a, rec.surface_b):
-            if not name:
+            if not name or (updated_names is not None and name not in updated_names):
                 continue
             obj = bpy.data.objects.get(name)
             if obj is None or obj.get("esp_custom_mesh") or len(obj.modifiers) > 0:

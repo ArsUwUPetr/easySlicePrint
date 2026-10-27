@@ -164,52 +164,18 @@ def boolean_mesh(context, base_mesh, cutter_mesh, operation, solver='AUTO'):
 # loose parts / join
 # ----------------------------------------------------------------------------
 def separate_loose_meshes(context, mesh):
-    """Split `mesh` into loose shells. Returns a list of NEW meshes (mesh itself is consumed)."""
-    scene = context.scene
-    obj = new_temp_object(scene, mesh, "_esp_sep")
-    view_layer = context.view_layer
-    # make sure the object is visible/selectable for the operator
-    obj.hide_set(False, view_layer=view_layer)
-    obj.hide_viewport = False
-    for o in view_layer.objects:
-        o.select_set(False)
-    obj.select_set(True)
-    view_layer.objects.active = obj
-    before = set(o.name for o in scene.objects)
-    try:
-        with context.temp_override(
-            active_object=obj,
-            object=obj,
-            selected_objects=[obj],
-            selected_editable_objects=[obj],
-            view_layer=view_layer,
-            scene=scene,
-        ):
-            bpy.ops.object.mode_set(mode='EDIT')
-            bpy.ops.mesh.select_all(action='SELECT')
-            bpy.ops.mesh.separate(type='LOOSE')
-            bpy.ops.object.mode_set(mode='OBJECT')
-    except RuntimeError:
-        # fallback: pure python flood fill
-        return _separate_loose_python(mesh, obj)
-    new_objs = [o for o in scene.objects if o.name not in before] + [obj]
-    meshes = []
-    for o in new_objs:
-        me = o.data
-        remove_object(o, remove_data=False)
-        if len(me.polygons) == 0:
-            remove_mesh(me)
-            continue
-        meshes.append(me)
-    return meshes
-
-
-def _separate_loose_python(mesh, obj):
+    """Split `mesh` into loose shells in O(N) without mode switching. Consumes `mesh`."""
     bm = bmesh.new()
     bm.from_mesh(mesh)
     bm.faces.ensure_lookup_table()
     bm.faces.index_update()
-    seen = np.zeros(len(bm.faces), dtype=bool)
+    n_faces = len(bm.faces)
+    if n_faces == 0:
+        bm.free()
+        remove_mesh(mesh)
+        return []
+
+    seen = np.zeros(n_faces, dtype=bool)
     comps = []
     for f in bm.faces:
         if seen[f.index]:
@@ -226,16 +192,35 @@ def _separate_loose_python(mesh, obj):
                         seen[lf.index] = True
                         stack.append(lf)
         comps.append(comp)
+
+    if len(comps) == 1:
+        bm.free()
+        return [mesh]
+
+    base_name = mesh.name
     meshes = []
     for comp in comps:
-        sub = bm.copy()
-        sub.faces.ensure_lookup_table()
-        keep = {f.index for f in comp}
-        bmesh.ops.delete(sub, geom=[f for f in sub.faces if f.index not in keep], context='FACES')
-        meshes.append(bmesh_to_mesh(sub, mesh.name + "_part"))
+        sub = bmesh.new()
+        v_map = {}
+        for f in comp:
+            f_verts = []
+            for v in f.verts:
+                sv = v_map.get(v.index)
+                if sv is None:
+                    sv = sub.verts.new(v.co)
+                    v_map[v.index] = sv
+                f_verts.append(sv)
+            try:
+                nf = sub.faces.new(f_verts)
+                nf.smooth = f.smooth
+                nf.material_index = f.material_index
+            except ValueError:
+                pass
+        meshes.append(bmesh_to_mesh(sub, base_name + "_part"))
         sub.free()
+
     bm.free()
-    remove_object(obj)
+    remove_mesh(mesh)
     return meshes
 
 
@@ -315,9 +300,11 @@ def manifold_report(mesh, limit=None):
 
 
 def bvh_from_mesh(mesh):
-    verts = [v.co.copy() for v in mesh.vertices]
-    polys = [tuple(p.vertices) for p in mesh.polygons]
-    return BVHTree.FromPolygons(verts, polys)
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bvh = BVHTree.FromBMesh(bm)
+    bm.free()
+    return bvh
 
 
 def bvh_from_pydata(verts, faces):

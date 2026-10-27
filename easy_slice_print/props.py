@@ -69,25 +69,6 @@ SURFACE_ORIGIN_ITEMS = [
     ),
 ]
 
-LOOP_FILL_ITEMS = [
-    (
-        'MEMBRANE',
-        "Membrane (Classic)",
-        "Standard Laplacian minimal surface (can create sharp overhangs on spiky rims)",
-    ),
-    # Disabled by request:
-    # (
-    #     'COLLAR',
-    #     "Normal Collar (90° Flange)",
-    #     "Steps straight into the model along the inward surface normal before filling, eliminating sharp overhangs",
-    # ),
-    # (
-    #     'BIHARMONIC',
-    #     "Biharmonic (Smooth 90°)",
-    #     "Smooth clamped-plate S-curve that enters at 90° to the outer wall and blends seamlessly into the center",
-    # ),
-]
-
 MIRROR_PIVOT_ITEMS = [
     ('TARGET', "Target Origin", "Mirror across the target object's origin and local axes"),
     ('WORLD', "World Origin", "Mirror across the world origin (0, 0, 0) and world axes"),
@@ -157,21 +138,23 @@ def _poll_scene_mesh(self, obj):
 def _target_obj_update(self, context):
     from . import plan
 
-    if getattr(plan, "_suspend", 0):
+    if plan.is_suspended():
         return
     self.target = self.target_obj.name if self.target_obj is not None else ""
+    plan.invalidate_validation_cache()
     plan.refresh_record_frames(context, self)
 
 
 def _cutter_obj_update(self, context):
     from . import plan
 
-    if getattr(plan, "_suspend", 0):
+    if plan.is_suspended():
         return
     if self.cutter_obj is not None:
         self.cutter_objects = self.cutter_obj.name
     elif "\t" not in self.cutter_objects:
         self.cutter_objects = ""
+    plan.invalidate_validation_cache()
     plan.refresh_record_frames(context, self)
 
 
@@ -293,7 +276,12 @@ def connector_props(update=None):
 class ESP_CutRecord(bpy.types.PropertyGroup):
     name: StringProperty(name="Name", default="Cut")
     cut_type: EnumProperty(name="Type", items=TOOL_ITEMS, default='STRAIGHT')
-    enabled: BoolProperty(name="Ready", default=True, description="Include this cut in the build")
+    enabled: BoolProperty(
+        name="Ready",
+        default=True,
+        description="Include this cut in the build",
+        update=lambda self, context: __import__(__package__ + ".plan", fromlist=["plan"]).invalidate_validation_cache(),
+    )
     show: BoolProperty(
         name="Show", default=True, description="Show the cut preview in the viewport", update=_record_show_update
     )
@@ -399,32 +387,6 @@ class ESP_Settings(bpy.types.PropertyGroup):
         name="Loop Smoothing",
         description="Round off a Freehand loop before the membrane is built",
         default=0.0,
-        min=0.0,
-        max=1.0,
-        subtype='FACTOR',
-        update=_surface_settings_update,
-    )
-    loop_fill_mode: EnumProperty(
-        name="Loop Profile",
-        description="How the interior of a Freehand loop is shaped near the outer wall",
-        items=LOOP_FILL_ITEMS,
-        default='MEMBRANE',
-        update=_surface_settings_update,
-    )
-    collar_depth_mm: FloatProperty(
-        name="Collar Depth",
-        description="How deep (in mm) the cut travels perpendicular to the outer wall before relaxing toward the center",
-        default=3.0,
-        min=0.1,
-        soft_max=500.0,
-        precision=2,
-        step=10,
-        update=_surface_settings_update,
-    )
-    collar_smoothing: FloatProperty(
-        name="Collar Smoothing",
-        description="Smooth the radial direction of the collar while keeping spike heights intact",
-        default=0.65,
         min=0.0,
         max=1.0,
         subtype='FACTOR',

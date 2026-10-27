@@ -29,6 +29,7 @@ that is subtracted from the model with a boolean.
 import math
 import bmesh
 from mathutils import Vector
+from mathutils.geometry import tessellate_polygon
 
 SURFACE_DETAIL = 3  # spline samples generated per control point segment
 RELAX_PASSES = 40  # membrane relaxation passes for a strongly non planar loop
@@ -315,44 +316,20 @@ def loop_flatness(points):
     return max(abs((p - c).dot(n)) for p in pts) / radius
 
 
-def _bridge_rings(outer, inner, faces):
-    """Triangulate between two closed rings of vertex indices of different lengths.
-
-    Both rings are walked by their normalised position, so the triangles stay well
-    shaped even when the inner ring carries far fewer points. Winding follows the
-    outer ring.
-    """
-    no, ni = len(outer), len(inner)
-    i = j = 0
-    while i < no or j < ni:
-        take_outer = j >= ni or (i < no and (i + 1) / no <= (j + 1) / ni)
-        if take_outer:
-            faces.append((outer[i % no], outer[(i + 1) % no], inner[j % ni]))
-            i += 1
-        else:
-            faces.append((inner[j % ni], outer[i % no], inner[(j + 1) % ni]))
-            j += 1
-
-
-def _circular_gaussian_smooth(pts, sigma_fraction):
-    """Smooth a closed 3D polyline using a scale-invariant circular filter.
-
-    Because the kernel width is a fraction of the total vertex count `m`,
-    increasing `Surface Detail` never creates more pleats or wrinkles!
-    """
-    m = len(pts)
-    if m < 4 or sigma_fraction <= 1e-5:
-        return [Vector(p) for p in pts]
-    # Number of passes scales quadratically with `m` to match the physical arc length
-    target_sigma = max(1.0, sigma_fraction * m)
-    passes = min(400, max(2, int(round(target_sigma * target_sigma * 0.35))))
-    cur = [Vector(p) for p in pts]
-    for _ in range(passes):
-        cur = [
-            (cur[(i - 1) % m] + cur[i] * 2.0 + cur[(i + 1) % m]) * 0.25
-            for i in range(m)
-        ]
-    return cur
+def triangulate_face_indices(verts, f):
+    """Triangulate polygon `f` (indices into `verts`), handling concave N-gons safely."""
+    k = len(f)
+    if k < 3:
+        return []
+    if k == 3:
+        return [(f[0], f[1], f[2])]
+    if k == 4:
+        return [(f[0], f[1], f[2]), (f[0], f[2], f[3])]
+    poly_pts = [Vector(verts[idx]) for idx in f]
+    tris = tessellate_polygon([poly_pts])
+    if not tris:
+        return [(f[0], f[i], f[i + 1]) for i in range(1, k - 1)]
+    return [(f[a], f[b], f[c]) for a, b, c in tris]
 
 
 def _relax_cotan_like(verts, faces, fixed, passes):
@@ -462,52 +439,12 @@ def _unfold_ring_2d(ring_xy, center_xy, u_axis, v_axis, strength=0.5):
     return out
 
 
-def _despike_loop(pts, passes=3, cos_thresh=-0.25):
-    """Removes isolated sharp spikes on a closed 3D loop caused by glancing raycasts or stroke seams."""
-    out = [Vector(p) for p in pts]
-    m = len(out)
-    if m < 5:
-        return out
-    for _ in range(passes):
-        nxt = [p.copy() for p in out]
-        for i in range(m):
-            prev_p = out[(i - 1) % m]
-            cur_p = out[i]
-            next_p = out[(i + 1) % m]
-            v1 = prev_p - cur_p
-            v2 = next_p - cur_p
-            l1, l2 = v1.length, v2.length
-            if l1 > 1e-8 and l2 > 1e-8:
-                # If the loop doubles back sharply at point i (spike), or deviates strongly from the chord:
-                cos_a = v1.dot(v2) / (l1 * l2)
-                chord = (next_p - prev_p).length
-                if cos_a > cos_thresh or (l1 + l2) > chord * 1.65:
-                    nxt[i] = cur_p.lerp((prev_p + next_p) * 0.5, 0.75)
-        out = nxt
-    return out
-
-
-def membrane_fill(
-    points,
-    rings=None,
-    passes=RELAX_PASSES,
-    mode='MEMBRANE',
-    inward_normals=None,
-    collar_depth=0.0,
-    collar_smooth=0.65,
-):
-    """Anisotropic harmonic cut generator for 3D printing:
-    - Forms a durable collar at the rim (prevents thin fragile walls).
-    - Tangential diffusion is 8x stronger than radial: sharp protrusions and zigzags
-      diffuse outward on the first few rings, preventing folds towards the center."""
+def membrane_fill(points, rings=None, passes=RELAX_PASSES):
+    """Anisotropic harmonic membrane generator for 3D printing."""
     bnd = [Vector(p) for p in points]
     m = len(bnd)
     if m < 3:
         raise ValueError("loop needs at least 3 points")
-
-    use_profile = mode in ('COLLAR', 'BIHARMONIC') and collar_depth > 1e-6
-    if use_profile:
-        bnd = _despike_loop(bnd, passes=4)
 
     patch_n = newell_normal(bnd)
     u_axis, v_axis = plane_basis(patch_n)
@@ -523,53 +460,29 @@ def membrane_fill(
     bnd_xy = [p - patch_n * ((p - plane_center).dot(patch_n)) for p in bnd]
 
     avg_rad = max(sum((p - plane_center).length for p in bnd_xy) / m, 1e-4)
-    eff_smooth = max(0.35, collar_smooth)
+    eff_smooth = 0.65
 
     # 2. Build guaranteed NON-INTERSECTING rings in the XY plane
-    # At each step inward, the loop smooths quickly and unfolds non-convex pockets (_unfold_ring_2d)
     ring_xy_list = [list(bnd_xy)]
     cur_xy = list(bnd_xy)
 
     for r in range(1, rings):
         t = r / rings
-        # Strong angle smoothing in XY on early rings
         cur_xy = _arclength_smooth_vec(bnd_xy, cur_xy, avg_rad * (0.08 + 0.30 * eff_smooth))
-        # Straighten concave zigzags so radial rays never create folds
         unfold_w = min(1.0, (t ** 0.65) * (0.55 + 0.45 * eff_smooth))
         cur_xy = _unfold_ring_2d(cur_xy, plane_center, u_axis, v_axis, strength=unfold_w)
-
         shrink = t ** 1.05
         ring_xy_list.append([p.lerp(plane_center, shrink) for p in cur_xy])
 
-    # 3. Anisotropic Z height calculation (rapid peak dampening + durable collar at rim)
-    # Heavily smoothed base wave (describes overall gentle saddle curve without spikes)
-    macro_z = _arclength_smooth_scalar(bnd_xy, bnd_z, avg_rad * 0.85)
-
-    safe_collar_bu = min(collar_depth, avg_rad * 0.22)
-    collar_ratio = max(0.08, min(0.30, safe_collar_bu / avg_rad))
-
+    # 3. Anisotropic Z height calculation
     cur_z = list(bnd_z)
     ring_z_list = [list(bnd_z)]
 
     for r in range(1, rings):
         t = r / rings
-        # Fast Z height diffusion along the ring: sharp peaks disappear within 2-3 rings
         cur_z = _arclength_smooth_scalar(bnd_xy, cur_z, avg_rad * (0.10 + 0.40 * eff_smooth))
-
-        if use_profile:
-            # On the first rings (within the collar), smoothly blend from local Z to global macro_z,
-            # maintaining wall thickness, then taper smoothly to 0 at the center
-            local_keep = math.exp(-((t / max(collar_ratio * 0.85, 0.10)) ** 1.6) * 2.5)
-            dome_fade = (1.0 - t) ** 1.5
-            r_z = [
-                (cur_z[i] * local_keep + macro_z[i] * (1.0 - local_keep)) * dome_fade
-                for i in range(m)
-            ]
-        else:
-            dome_fade = (1.0 - t) ** 1.3
-            r_z = [cur_z[i] * dome_fade for i in range(m)]
-
-        ring_z_list.append(r_z)
+        dome_fade = (1.0 - t) ** 1.3
+        ring_z_list.append([cur_z[i] * dome_fade for i in range(m)])
 
     # 4. Construct mesh
     verts = []
@@ -594,17 +507,13 @@ def membrane_fill(
     for i in range(m):
         faces.append([last[i], last[(i + 1) % m], centre_idx])
 
-    # 5. Anisotropic 3D relaxation (Tangential-Dominant Smoothing):
-    # Smoothing weight along rings is 4x higher than across rings.
-    # This eliminates radial ridges and creases while preserving a smooth bowl profile!
+    # 5. Anisotropic 3D relaxation (Tangential-Dominant Smoothing)
     relax_iters = max(45, int(round(passes * 1.4)))
     for _ in range(relax_iters):
         nxt_verts = list(verts)
         for r in range(1, rings):
             t = r / rings
-            # At the very edge (r=1), moderate stiffness preserves entrance angle, then full freedom
-            stiffness = 0.55 if (use_profile and r == 1) else min(0.92, 0.65 + 0.30 * t)
-            # Anisotropic neighbor weights: tangential neighbors (along the ring) pull stronger than radial ones!
+            stiffness = min(0.92, 0.65 + 0.30 * t)
             w_tan = 0.36
             w_rad = 0.14
             row = ring_idx[r]
@@ -621,7 +530,6 @@ def membrane_fill(
                 avg_v = (p_prev + p_next) * w_tan + (p_out + p_in) * w_rad
                 nxt_verts[v_i] = verts[v_i].lerp(avg_v, stiffness)
 
-        # Center point relaxation
         last_row = ring_idx[-1]
         nxt_verts[centre_idx] = sum((verts[j] for j in last_row), Vector((0.0, 0.0, 0.0))) / m
         verts = nxt_verts
@@ -660,30 +568,14 @@ def loop_boundary(points, detail=SURFACE_DETAIL):
     return pts
 
 
-def loop_patch(
-    points,
-    detail=SURFACE_DETAIL,
-    passes=None,
-    boundary=None,
-    mode='MEMBRANE',
-    inward_normals=None,
-    collar_depth=0.0,
-    collar_smooth=0.65,
-):
+def loop_patch(points, detail=SURFACE_DETAIL, passes=None, boundary=None):
     """Fill a closed loop with a smooth surface. Returns (verts, faces)."""
     pts = [Vector(p) for p in boundary] if boundary is not None else loop_boundary(points, detail)
     if len(pts) < 3:
         raise ValueError("loop needs at least 3 points")
     if passes is None:
         passes = max(8, int(round(RELAX_PASSES * min(1.0, 0.2 + loop_flatness(pts) * 4.0))))
-    return membrane_fill(
-        pts,
-        passes=passes,
-        mode=mode,
-        inward_normals=inward_normals,
-        collar_depth=collar_depth,
-        collar_smooth=collar_smooth,
-    )
+    return membrane_fill(pts, passes=passes)
 
 
 def rim_outward(verts, faces, rim):
@@ -801,73 +693,6 @@ def with_skirt(verts, faces, rim, ring):
         # winding opposite to the fill's (rim i -> i+1), so the skirt faces the same way
         out_f.append((j, i, base + i, base + j))
     return out_v, out_f
-
-
-def boundary_skirt_loops(verts, faces):
-    """Find ordered boundary loops and outward directions on an arbitrary open mesh.
-
-    Returns a list of (loop_indices, outward_vectors) so any user-edited mesh or
-    modifier stack output can grow a clearance skirt along its open boundary edges.
-    """
-    bm = bmesh.new()
-    bverts = [bm.verts.new(Vector(v)) for v in verts]
-    bm.verts.ensure_lookup_table()
-    bm.verts.index_update()
-    for f in faces:
-        try:
-            bm.faces.new([bverts[i] for i in f])
-        except ValueError:
-            pass
-    if not bm.faces:
-        bm.free()
-        return []
-    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
-
-    # Outward tangent per boundary vertex, orthogonal to boundary edge and face normal
-    out_dir = {}
-    next_v = {}
-    for f in bm.faces:
-        fn = f.normal
-        for loop in f.loops:
-            if not loop.edge.is_boundary:
-                continue
-            a = loop.vert
-            b = loop.link_loop_next.vert
-            next_v[a.index] = b.index
-            d = b.co - a.co
-            if d.length < 1e-12:
-                continue
-            outward = d.normalized().cross(fn)
-            if outward.length > 1e-12:
-                outward.normalize()
-                out_dir[a.index] = out_dir.get(a.index, Vector((0.0, 0.0, 0.0))) + outward
-                out_dir[b.index] = out_dir.get(b.index, Vector((0.0, 0.0, 0.0))) + outward
-
-    visited = set()
-    loops = []
-    for start in list(next_v.keys()):
-        if start in visited:
-            continue
-        ring_idx = []
-        cur = start
-        while cur is not None and cur not in visited:
-            visited.add(cur)
-            ring_idx.append(cur)
-            cur = next_v.get(cur)
-        if len(ring_idx) >= 3 and cur == start:
-            dirs = []
-            for idx in ring_idx:
-                v = out_dir.get(idx, Vector((0.0, 0.0, 0.0)))
-                dirs.append(v.normalized() if v.length > 1e-12 else Vector((0.0, 0.0, 0.0)))
-            m = len(dirs)
-            for _ in range(3):
-                dirs = [
-                    ((dirs[(i - 1) % m] + dirs[i] * 2.0 + dirs[(i + 1) % m]) * 0.25).normalized()
-                    for i in range(m)
-                ]
-            loops.append((ring_idx, dirs))
-    bm.free()
-    return loops
 
 
 def patch_normal(verts, faces):

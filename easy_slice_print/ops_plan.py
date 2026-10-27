@@ -785,6 +785,9 @@ class ESP_OT_build(jobs.JobMixin, bpy.types.Operator):
         s.build_in_progress = False
         s.build_status = ""
         if state == jobs.CANCELLED:
+            for r in s.cuts:
+                if r.build_state in {'WAIT', 'ACTIVE'}:
+                    r.build_state = 'NONE'
             s.last_message = "Build cancelled"
             self.report({'WARNING'}, "Build cancelled - the parts made so far were kept")
             return {'CANCELLED'}
@@ -1091,14 +1094,12 @@ class ESP_OT_swap_joint_roles(bpy.types.Operator):
         # Swap target with the first cutter object
         new_target = old_cutters[0]
         new_cutters = [old_target] + old_cutters[1:]
-        plan._suspend += 1
-        try:
+        with plan.suspend_updates():
             rec.target = new_target.name
             rec.target_obj = new_target
             rec.cutter_objects = "\t".join(o.name for o in new_cutters)
             rec.cutter_obj = new_cutters[0] if len(new_cutters) == 1 else None
-        finally:
-            plan._suspend -= 1
+        plan.invalidate_validation_cache()
         if context.scene.esp.base_object == old_target.name:
             context.scene.esp.base_object = new_target.name
 
@@ -1144,12 +1145,10 @@ class ESP_OT_set_selected_cutters(bpy.types.Operator):
         if not sel:
             self.report({'WARNING'}, "Select at least one mesh object other than the target")
             return {'CANCELLED'}
-        plan._suspend += 1
-        try:
+        with plan.suspend_updates():
             rec.cutter_objects = "\t".join(o.name for o in sel)
             rec.cutter_obj = sel[0] if len(sel) == 1 else None
-        finally:
-            plan._suspend -= 1
+        plan.invalidate_validation_cache()
         plan.refresh_record_frames(context, rec)
         self.report({'INFO'}, f"Set {len(sel)} cutter object(s) for '{rec.name}'")
         return {'FINISHED'}
@@ -1170,12 +1169,10 @@ class ESP_OT_clear_missing_cutters(bpy.types.Operator):
         rec = active_record(context)
         plan.sync_record_pointers(rec)
         valid = [o.name for o in plan.cutter_object_list(rec)]
-        plan._suspend += 1
-        try:
+        with plan.suspend_updates():
             rec.cutter_objects = "\t".join(valid)
             rec.cutter_obj = bpy.data.objects.get(valid[0]) if len(valid) == 1 else None
-        finally:
-            plan._suspend -= 1
+        plan.invalidate_validation_cache()
         plan.refresh_record_frames(context, rec)
         self.report({'INFO'}, f"Cleaned missing cutters from '{rec.name}'")
         return {'FINISHED'}

@@ -71,12 +71,14 @@ def _surface_geometry(diag, verts, faces):
     """
     if not verts or not faces:
         return None
+    from .core import surfaces
+
     pts = [Vector(v) for v in verts]
     tris = []
     limit = diag.radius * 0.5 if diag.cut else 1e30
     for f in faces:
-        for k in range(1, len(f) - 1):
-            _split_triangle(pts[f[0]], pts[f[k]], pts[f[k + 1]], limit, SPLIT_DEPTH, tris)
+        for i0, i1, i2 in surfaces.triangulate_face_indices(pts, f):
+            _split_triangle(pts[i0], pts[i1], pts[i2], limit, SPLIT_DEPTH, tris)
     if not tris:
         return None
     index = {}

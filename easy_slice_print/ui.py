@@ -175,8 +175,8 @@ class ESP_PT_plan(ESPPanel, bpy.types.Panel):
         col.separator()
         col.operator("esp.refresh_pins", text="", icon='FILE_REFRESH')
 
-        # Fast visual pre-flight check in list
-        errs = plan.validate_plan(context, paint_overlay=False)
+        # Fast visual pre-flight check in list (cached)
+        errs = plan.validate_plan_cached(context)
         if errs:
             box = layout.box()
             box.label(text=f"{len(errs)} issue(s) detected:", icon='ERROR')
